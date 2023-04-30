@@ -1,0 +1,9 @@
+menu "ESP File System journaling"
+
+    config ESP_JRNL_ENABLE_TESTMODE
+        bool
+        default y
+        help
+            Hidden option for the component tests (enables built-in test configurations)
+
+endmenu # esp_jrnl
