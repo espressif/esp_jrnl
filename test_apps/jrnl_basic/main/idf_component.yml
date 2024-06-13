@@ -1,0 +1,4 @@
+dependencies:
+  esp_jrnl:
+    version: "*"
+    override_path: '../../..'
