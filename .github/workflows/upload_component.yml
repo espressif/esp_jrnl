@@ -2,9 +2,8 @@ name: Push esp_jrnl to IDF Component Registry
 
 on:
   push:
-    branches:
-      - main
-
+    tags:
+      - v*
 jobs:
   upload_components:
     runs-on: ubuntu-latest
@@ -16,4 +15,5 @@ jobs:
         with:
           name: esp_jrnl
           namespace: "espressif"
+          version: ${{ github.ref_name }}
           api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
