@@ -33,8 +33,6 @@ const char* s_partlabel = "jrnl";
 static uint8_t* s_buf_write = NULL;
 static uint8_t* s_buf_read = NULL;
 
-static bool s_check_unmount_on_teardown = true;
-
 static void test_setup(void)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -101,13 +99,10 @@ TEST_TEAR_DOWN(jrnl_basic)
     free(s_buf_write);
     free(s_buf_read);
 
-    if (s_check_unmount_on_teardown) {
-        if (s_jrnl_handle != JRNL_INVALID_HANDLE) {
-            test_teardown();
-        }
+    if (s_jrnl_handle != JRNL_INVALID_HANDLE) {
+        test_teardown();
     }
 }
-
 
 TEST(jrnl_basic, jrnl_creation)
 {
@@ -143,8 +138,7 @@ TEST(jrnl_basic, jrnl_creation)
     esp_jrnl_master_t jrnl_master;
     TEST_ESP_OK(wl_read(wl_handle, wlpartsize-wlsectorsize, (void*)&jrnl_master, sizeof(esp_jrnl_master_t)));
 
-#ifdef CONFIG_LOG_DEFAULT_LEVEL_VERBOSE
-    ESP_LOGV(TAG, "jrnl master record read from disk:");
+#ifdef CONFIG_ESP_JRNL_DEBUG_PRINT
     print_jrnl_master(&jrnl_master);
 #endif
 

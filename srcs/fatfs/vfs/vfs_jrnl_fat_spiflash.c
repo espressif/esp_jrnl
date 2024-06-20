@@ -62,22 +62,6 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
         ESP_LOGV(TAG, "WL partition size (wl_size, sector_count): %"PRIu32 ", %"PRIu32, (uint32_t)wl_size(wl_handle), (uint32_t)(wl_size(wl_handle) / wl_sector_size(wl_handle)));
 
         //2. mount journaling layer (ESP_JRNL_STATUS_FS_INIT)
-        /*
-        esp_jrnl_config_extended_t jrnl_config_ext = {
-                .user_cfg = *jrnl_config,
-                .fs_volume_id = pdrv,
-                .volume_cfg = {
-                        .volume_size = wl_size(wl_handle),
-                        .disk_sector_size = wl_sector_size(wl_handle)
-                },
-                .diskio_cfg = {
-                        .diskio_ctrl_handle = wl_handle,
-                        .disk_read = &wl_read,
-                        .disk_write = &wl_write,
-                        .disk_erase_range = &wl_erase_range
-                }
-        };
-         */
         esp_jrnl_config_extended_t jrnl_config_ext = {
                 .user_cfg = *jrnl_config,
                 .fs_volume_id = pdrv,
@@ -125,7 +109,6 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
 
         if (!need_mount_again) {
             FRESULT fres = f_mount(fs, drv, 1);
-            ESP_LOGW(TAG, "f_mount result = %d", fres);
             if (fres != FR_OK) {
                 need_mount_again =
                         (fres == FR_NO_FILESYSTEM || fres == FR_INT_ERR) && mount_config->format_if_mount_failed;
@@ -133,13 +116,10 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
                     ESP_LOGE(TAG, "f_mount failed (%d)", fres);
                     result = ESP_FAIL;
                     break;
-                }
-                else {
+                } else {
                     ESP_LOGD(TAG, "No file-system found");
                 }
             }
-        } else {
-            ESP_LOGD(TAG, "Formatting FATFS partition forced by config");
         }
 
         if (need_mount_again) {
@@ -156,7 +136,7 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
             const MKFS_PARM opt = {(BYTE)(FM_ANY | FM_SFD), 0, 0, 0, alloc_unit_size};
             FRESULT fresult = f_mkfs(drv, &opt, workbuf, workbuf_size);
 
-            free(workbuf);
+            ff_memfree(workbuf);
             workbuf = NULL;
 
             if (fresult != FR_OK) {
@@ -188,7 +168,7 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
     }
     else {
         esp_err_t err_temp = esp_vfs_fat_spiflash_unmount_jrnl(&jrnl_handle_temp, base_path);
-        if( err_temp != ESP_OK) {
+        if (err_temp != ESP_OK) {
             ESP_LOGE(TAG, "esp_vfs_fat_spiflash_unmount_jrnl() failed with error 0x%08X)", err_temp);
         }
     }
