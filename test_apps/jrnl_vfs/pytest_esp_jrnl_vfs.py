@@ -8,4 +8,4 @@ from pytest_embedded import Dut
 @pytest.mark.supported_targets
 @pytest.mark.generic
 def test_jrnl_vfs(dut: Dut) -> None:
-    dut.run_all_single_board_cases(reset=True)
+    dut.expect_unity_test_output()

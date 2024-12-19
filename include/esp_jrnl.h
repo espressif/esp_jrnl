@@ -43,7 +43,7 @@ typedef struct {
     .overwrite_existing = false, \
     .replay_journal_after_mount = true, \
     .force_fs_format = false, \
-    .store_size_sectors = 16 \
+    .store_size_sectors = 32 \
 }
 
 #define ESP_JRNL_VOLUME_DEFAULT_CONFIG(wl_hndl) { \

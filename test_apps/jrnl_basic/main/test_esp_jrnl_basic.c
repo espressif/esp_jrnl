@@ -44,7 +44,7 @@ static void test_setup(void)
         .overwrite_existing = true,
         .force_fs_format = true,
         .replay_journal_after_mount = false,
-        .store_size_sectors = 16
+        .store_size_sectors = 32
     };
 
     ESP_LOGV(TAG, "test_setup: esp_vfs_fat_spiflash_mount_rw_wl_jrnl(%s, %s)", s_basepath, s_partlabel);
@@ -253,7 +253,7 @@ TEST(jrnl_basic, jrnl_mount_unmount)
             .overwrite_existing = true,
             .force_fs_format = true,
             .replay_journal_after_mount = false,
-            .store_size_sectors = 16
+            .store_size_sectors = 32
     };
 
     TEST_ESP_OK(esp_vfs_fat_spiflash_mount_jrnl(s_basepath, s_partlabel, &mount_config, &jrnl_config, &s_jrnl_handle));

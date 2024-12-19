@@ -122,7 +122,7 @@ static void test_setup_jrnl(esp_jrnl_config_t* jrnl_config)
         jrnl_config_def = (esp_jrnl_config_t*)malloc(sizeof(esp_jrnl_config_t));
         TEST_ASSERT(jrnl_config_def != NULL);
 
-        jrnl_config_def->store_size_sectors = 16;
+        jrnl_config_def->store_size_sectors = 32;
         jrnl_config_def->replay_journal_after_mount = false;
         jrnl_config_def->overwrite_existing = true;
         jrnl_config_def->force_fs_format = true;

@@ -6,7 +6,7 @@ NOTE: **esp_jrnl** is chip-type agnostic. Current implementation supports only t
 
 ## Overview
 
-The journaling feature operates within a space of one partition on the target media/disk. It requires to occupy certain part of the partition space for its internal operations (so called "journaling store"), which is a sector-aligned section at the partition's end. The journaling store size is configurable and is set to 16 sectors by default. The store is used for holding the journaling transaction data and metadata. Consequently, the space actually available for the file system is the capacity required by the partition table minus the journaling store size, and minus the wear levelling cache in case of FatFS/SPI_Flash implementation.
+The journaling feature operates within a space of one partition on the target media/disk. It requires to occupy certain part of the partition space for its internal operations (so called "journaling store"), which is a sector-aligned section at the partition's end. The journaling store size is configurable and is set to 32 sectors by default. The store is used for holding the journaling transaction data and metadata. Consequently, the space actually available for the file system is the capacity required by the partition table minus the journaling store size, and minus the wear levelling cache in case of FatFS/SPI_Flash implementation.
 
 The component works transparently from user's perspective, the only required steps are configuration and mounting/unmounting using dedicated APIs:
 
@@ -57,7 +57,7 @@ Basic journaling unit is a sector of the same size as given by related file syst
     |<--------  - - -                  - - - PARTITION SPACE - - -                 - - -  -------->|
     |----------------------------------------------------------------------------------------------|
 
-Basic **esp_jrnl** configuration is given the following structure (`ESP_JRNL_DEFAULT_CONFIG` macros provided):
+Basic **esp_jrnl** configuration is given the following structure:
 
 ```
 typedef struct {
@@ -66,6 +66,17 @@ bool replay_journal_after_mount;        /* true = apply unfinished-commit transa
 bool force_fs_format;                   /* (re)format journaled file-system */
 size_t store_size_sectors;              /* journal store size in sectors (disk space deducted from WL partition end) */
 } esp_jrnl_config_t;
+```
+
+Default configuration is provided by `ESP_JRNL_DEFAULT_CONFIG` macro:
+
+```
+#define ESP_JRNL_DEFAULT_CONFIG() {
+.overwrite_existing = false,
+.replay_journal_after_mount = true,
+.force_fs_format = false,
+.store_size_sectors = 32
+}
 ```
 
 All the persistent journaling store info is available in the master record:
