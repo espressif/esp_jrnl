@@ -17,7 +17,11 @@
 #include "esp_crc.h"
 #include "esp_jrnl_internal.h"
 
-static const char* TAG = "esp_fs_journal";
+#ifdef CONFIG_ESP_JRNL_ENABLE_TESTMODE
+#include "esp_system.h"
+#endif
+
+static const char* TAG = "esp_jrnl";
 static _lock_t s_instances_lock;
 
 esp_jrnl_instance_t* s_jrnl_instance_ptrs[JRNL_MAX_HANDLES] = {
@@ -28,7 +32,7 @@ static const char* jrnl_status_to_str(esp_jrnl_trans_status_t status)
 {
     switch(status)
     {
-        case ESP_JRNL_STATUS_FS_INIT: return "Initialize";
+        case ESP_JRNL_STATUS_FS_INIT: return "Initialize/FS-direct";
         case ESP_JRNL_STATUS_TRANS_READY: return "Ready";
         case ESP_JRNL_STATUS_TRANS_OPEN: return "Open";
         case ESP_JRNL_STATUS_TRANS_COMMIT: return "Commit";
@@ -139,12 +143,13 @@ static void jrnl_delete_instance(esp_jrnl_instance_t* inst_ptr)
 
 static inline esp_err_t jrnl_update_master(esp_jrnl_instance_t* jrnl, const esp_jrnl_master_t* master)
 {
+    ESP_LOGD(TAG, "Updating jrnl master record (status: %s)", jrnl_status_to_str(jrnl->master.status));
     return jrnl_write_internal(jrnl, (const uint8_t*)master, jrnl->master.store_size_sectors - 1, 1);
 }
 
 /* reset the JRNL master record for given instance
  * the reset applies only to the structure items, the rest of the sector space is expected = 0 */
-esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool init)
+esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool fs_direct)
 {
     ESP_LOGV(TAG, "Resetting jrnl master record");
     if (jrnl == NULL) {
@@ -153,19 +158,28 @@ esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool init)
 
     jrnl->master.jrnl_magic_mark = JRNL_STORE_MARKER;
     jrnl->master.next_free_sector = 0;
-    jrnl->master.status = init ? ESP_JRNL_STATUS_FS_INIT : ESP_JRNL_STATUS_TRANS_READY;
+    jrnl->master.status = fs_direct ? ESP_JRNL_STATUS_FS_DIRECT : ESP_JRNL_STATUS_TRANS_READY;
 
     return jrnl_update_master(jrnl, &jrnl->master);
 }
 
 #ifdef CONFIG_ESP_JRNL_ENABLE_TESTMODE
+
+//power-off emulation: interrupt the transaction only when some data written to the journal
 #define JRNL_TEST_PRELIMINARY_EXIT(flags, msg) \
-    if (inst_ptr->test_config & flags) { \
+    if (inst_ptr->master.next_free_sector > 0 && inst_ptr->test_config & flags) { \
+        ESP_LOGD(TAG, msg); \
+        esp_restart(); \
+    }
+
+#define JRNL_TEST_TRANSACTION_SUSPENDED(msg) \
+    if (inst_ptr->test_config & ESP_JRNL_TEST_SUSPEND_TRANSACTION) { \
         ESP_LOGD(TAG, msg); \
         return ESP_OK; \
     }
 #else
-JRNL_TEST_PRELIMINARY_EXIT(flags, msg)
+#define JRNL_TEST_PRELIMINARY_EXIT(flags, msg)
+#define JRNL_TEST_TRANSACTION_SUSPENDED(msg)
 #endif
 
 esp_err_t jrnl_replay(esp_jrnl_instance_t* inst_ptr)
@@ -180,7 +194,13 @@ esp_err_t jrnl_replay(esp_jrnl_instance_t* inst_ptr)
     esp_err_t err = ESP_OK;
     _lock_acquire(&inst_ptr->trans_lock);
 
-    //replay only uncommitted transactions
+#ifdef CONFIG_ESP_JRNL_DEBUG_PRINT
+    print_jrnl_instance(inst_ptr);
+#endif
+
+    assert(inst_ptr->master.status != ESP_JRNL_STATUS_FS_INIT && "Attempt to reply uninitialized journaling store!");
+
+    //clean possibly uncommitted transactions
     if (inst_ptr->master.status != ESP_JRNL_STATUS_TRANS_COMMIT) {
 
         switch (inst_ptr->master.status)
@@ -312,7 +332,7 @@ void print_jrnl_config_extended(const esp_jrnl_config_extended_t *config)
     esp_rom_printf("    disk_erase_range: Ox%08X\n", (uint32_t)config->diskio_cfg.disk_erase_range);
 }
 
-void print_jrnl_master(esp_jrnl_master_t* jrnl_master)
+void print_jrnl_master(const esp_jrnl_master_t* jrnl_master)
 {
     esp_rom_printf("\nJRNL master record:\n");
     esp_rom_printf("   jrnl_magic_mark: 0x%08" PRIX32 "\n", jrnl_master->jrnl_magic_mark);
@@ -323,6 +343,57 @@ void print_jrnl_master(esp_jrnl_master_t* jrnl_master)
     esp_rom_printf("   volume.store_volume_offset_sector: %" PRIu32 "\n", (uint32_t)jrnl_master->store_volume_offset_sector);
     esp_rom_printf("   volume.disk_sector_size: %" PRIu32 "\n", (uint32_t)jrnl_master->volume.disk_sector_size);
 }
+
+void print_jrnl_instance(esp_jrnl_instance_t* inst_ptr)
+{
+    esp_jrnl_master_t* jrnl_master = &inst_ptr->master;
+
+    print_jrnl_master(jrnl_master);
+
+    //iterate through stored operation records and try to repeat them all
+    uint32_t oper_sector_index = 0;
+    uint8_t* header = (uint8_t *)calloc(1, jrnl_master->volume.disk_sector_size);
+    if (header == NULL) {
+        ESP_LOGE(TAG, "print_jrnl_instance failed with error (0x%08X)", ESP_ERR_NO_MEM);
+        return;
+    }
+
+    //journaling store can be empty
+    esp_err_t err = ESP_OK;
+    size_t record_count = 0;
+    while (oper_sector_index < jrnl_master->next_free_sector) {
+
+        //read the operation header
+        err = jrnl_read_internal(inst_ptr, header, oper_sector_index, 1);
+        if (err != ESP_OK) {
+            break;
+        }
+
+        esp_jrnl_operation_t* oper_header = (esp_jrnl_operation_t*)header;
+        uint32_t crc32_header = esp_crc32_le(UINT32_MAX, header, sizeof(esp_jrnl_oper_header_t));
+        if (crc32_header != oper_header->crc32_header) {
+            err = ESP_ERR_INVALID_CRC;
+            ESP_LOGE(TAG, "print_jrnl_instance - operation header checksum mismatch, aborting");
+            break;
+        }
+
+        //print the header
+        esp_rom_printf("\n   OPER.HEADER %u:\n", record_count);
+        esp_rom_printf("      header.target_sector: %" PRIu32 "\n", oper_header->header.target_sector);
+        esp_rom_printf("      header.sector_count: %" PRIu32 "\n", oper_header->header.sector_count);
+        esp_rom_printf("      header.crc32_data: Ox%08X\n", oper_header->header.crc32_data);
+        esp_rom_printf("      crc32_header: Ox%08X\n", oper_header->crc32_header);
+
+        oper_sector_index += (1 + oper_header->header.sector_count);
+        record_count++;
+    }
+
+    free(header);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "print_jrnl_instance failed with error (0x%08X)", err);
+    }
+}
+
 
 /*
  * PUBLIC APIS
@@ -378,7 +449,7 @@ esp_err_t esp_jrnl_mount(const esp_jrnl_config_extended_t *config, esp_jrnl_hand
         ESP_LOGV(TAG, "jrnl volume ID: %" PRIu8", total volume size: %" PRIu32 ", disk_sector_size: %" PRIu32 ", master record address: %" PRIu32,
                  jrnl->fs_volume_id, (uint32_t)config->volume_cfg.volume_size, (uint32_t)config->volume_cfg.disk_sector_size, (uint32_t)(config->volume_cfg.volume_size - config->volume_cfg.disk_sector_size));
 
-        //check possibly uncommitted transaction stored in the journal
+        //check possibly uncommitted transaction stored in the journal, unless configured to ignore all journaled data
         bool need_fresh_journal = config->user_cfg.force_fs_format || config->user_cfg.overwrite_existing;
         if (!need_fresh_journal) {
 
@@ -426,7 +497,7 @@ esp_err_t esp_jrnl_mount(const esp_jrnl_config_extended_t *config, esp_jrnl_hand
         jrnl->master.volume = config->volume_cfg;
 
         //journal instance created with ESP_JRNL_STATUS_FS_INIT status
-        err = jrnl_reset_master(jrnl, true);
+        err = jrnl_reset_master(jrnl, need_fresh_journal);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to reset journaling master record (0x%08X)", err);
             break;
@@ -471,7 +542,7 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle)
 
 esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
 {
-    ESP_LOGV(TAG, "esp_jrnl_start (handle: %ld)", handle);
+    ESP_LOGD(TAG, "esp_jrnl_start (handle: %ld)", handle);
 
     esp_err_t err = jrnl_check_handle(handle, __func__);
     if (err != ESP_OK) {
@@ -479,8 +550,11 @@ esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
     }
 
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
+    JRNL_TEST_TRANSACTION_SUSPENDED("esp_jrnl_start() suspended");
 
     _lock_acquire(&inst_ptr->trans_lock);
+
+    ESP_LOGD(TAG, "esp_jrnl_start (current status: %s)", jrnl_status_to_str(inst_ptr->master.status));
 
     if (inst_ptr->master.status == ESP_JRNL_STATUS_TRANS_READY) {
 
@@ -496,7 +570,7 @@ esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
     }
     else {
         err = ESP_ERR_INVALID_STATE;
-        ESP_LOGE(TAG, "Can't open new journaling transaction (0x%08X)", err);
+        ESP_LOGE(TAG, "Can't open new journaling transaction (status=%s, err=0x%08X)", jrnl_status_to_str(inst_ptr->master.status), err);
     }
 
     _lock_release(&inst_ptr->trans_lock);
@@ -507,7 +581,7 @@ esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
 //MV2DO: locking logic needs revamping (separate task to support multithreading)
 esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit)
 {
-    ESP_LOGV(TAG, "esp_jrnl_stop (handle: %ld, commit: %u)", handle, commit);
+    ESP_LOGD(TAG, "esp_jrnl_stop (handle: %ld, commit: %u)", handle, commit);
 
     esp_err_t err = jrnl_check_handle(handle, __func__);
     if (err != ESP_OK) {
@@ -515,6 +589,7 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit)
     }
 
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
+    JRNL_TEST_TRANSACTION_SUSPENDED("esp_jrnl_stop() suspended");
 
     //cancel the transaction
     if (!commit) {
@@ -606,9 +681,9 @@ esp_err_t esp_jrnl_get_sector_size(const esp_jrnl_handle_t handle, size_t* secto
     return ESP_OK;
 }
 
-esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool init)
+esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct_access)
 {
-    ESP_LOGV(TAG, "esp_jrnl_set_direct_io (handle: %ld, on: %u)", handle, init);
+    ESP_LOGV(TAG, "esp_jrnl_set_direct_io (handle: %ld, on: %u)", handle, direct_access);
 
     esp_err_t err = jrnl_check_handle(handle, __func__);
     if (err != ESP_OK) {
@@ -617,11 +692,13 @@ esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool init)
 
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     _lock_acquire(&inst_ptr->trans_lock);
-    if (inst_ptr->master.status != ESP_JRNL_STATUS_FS_INIT && inst_ptr->master.status != ESP_JRNL_STATUS_TRANS_READY) {
+
+    //direct FS access switching cannot be required during a transaction lifetime
+    if (inst_ptr->master.status != ESP_JRNL_STATUS_FS_DIRECT && inst_ptr->master.status != ESP_JRNL_STATUS_TRANS_READY) {
         err = ESP_ERR_INVALID_STATE;
     }
     else {
-        inst_ptr->master.status = init ? ESP_JRNL_STATUS_FS_INIT : ESP_JRNL_STATUS_TRANS_READY;
+        inst_ptr->master.status = direct_access ? ESP_JRNL_STATUS_FS_DIRECT : ESP_JRNL_STATUS_TRANS_READY;
         err = jrnl_update_master(inst_ptr, &inst_ptr->master);
     }
     _lock_release(&inst_ptr->trans_lock);
@@ -645,17 +722,28 @@ esp_err_t esp_jrnl_write(const esp_jrnl_handle_t handle, const uint8_t *buff, co
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     uint32_t sector_size = inst_ptr->master.volume.disk_sector_size;
 
+    //allow direct disk access when FS is being formatted or for testing reasons
+    if (inst_ptr->master.status == ESP_JRNL_STATUS_FS_DIRECT) {
+        ESP_LOGV(TAG, "esp_jrnl_write (handle: %ld) - direct write", handle);
+        err = jrnl_erase_range_raw(inst_ptr, sector * sector_size, count * sector_size);
+        if (err == ESP_OK) {
+            err = jrnl_write_raw(inst_ptr, sector * sector_size, buff, count * sector_size);
+        }
+        return err;
+    }
+
     //write to the journaling store only if a transaction is open
     if (inst_ptr->master.status == ESP_JRNL_STATUS_TRANS_OPEN) {
 
         //operation: header sector + count*[data sector]
         if ((inst_ptr->master.next_free_sector + 1 + count) < (inst_ptr->master.store_size_sectors - 1)) {
 
+            esp_jrnl_operation_t *oper_header = NULL;
             _lock_acquire(&inst_ptr->trans_lock);
 
             do {
                 //create header
-                esp_jrnl_operation_t *oper_header = (esp_jrnl_operation_t *) calloc(1, sector_size);
+                oper_header = (esp_jrnl_operation_t *) calloc(1, sector_size);
                 if (oper_header == NULL) {
                     err = ESP_ERR_NO_MEM;
                     ESP_LOGE(TAG, "esp_jrnl_write failed (can't allocate the operation header, 0x%08X)", err);
@@ -702,6 +790,7 @@ esp_err_t esp_jrnl_write(const esp_jrnl_handle_t handle, const uint8_t *buff, co
             } while(false);
 
             _lock_release(&inst_ptr->trans_lock);
+            free(oper_header);
 
             if (err != ESP_OK) {
                 return err;
@@ -713,18 +802,8 @@ esp_err_t esp_jrnl_write(const esp_jrnl_handle_t handle, const uint8_t *buff, co
         }
     }
     else {
-        //allow direct disk access when FS is being formatted
-        if (inst_ptr->master.status == ESP_JRNL_STATUS_FS_INIT) {
-            err = jrnl_erase_range_raw(inst_ptr, sector * sector_size, count * sector_size);
-            if (err == ESP_OK) {
-                err = jrnl_write_raw(inst_ptr, sector * sector_size, buff, count * sector_size);
-            }
-            return err;
-        }
-
-        ESP_LOGE(TAG, "esp_jrnl_write() failed due to invalid transaction status (0x%08X)", inst_ptr->master.status);
-
         //any other case must fail to avoid JRNL corruption
+        ESP_LOGE(TAG, "esp_jrnl_write() failed due to invalid transaction status (0x%08X)", inst_ptr->master.status);
         return ESP_ERR_INVALID_STATE;
     }
 

@@ -26,6 +26,7 @@ extern "C" {
  */
 typedef enum {
     ESP_JRNL_STATUS_FS_INIT,                /* file-system is being mounted/formatted on the journaled volume */
+    ESP_JRNL_STATUS_FS_DIRECT = ESP_JRNL_STATUS_FS_INIT, /* alias for better code readability */
     ESP_JRNL_STATUS_TRANS_READY,            /* fresh new log or the last transaction processed completely */
     ESP_JRNL_STATUS_TRANS_OPEN,             /* journaling transaction running */
     ESP_JRNL_STATUS_TRANS_COMMIT            /* journaling transaction being committed to the target disk */
@@ -75,20 +76,33 @@ typedef struct {
  * All the flags cause preliminary exit of esp_jrnl_stop() or jrnl_replay() in various stages, all return with ESP_OK
  * The point is to emulate power-off event at sensitive points of the journaling code workflow */
 #ifdef CONFIG_ESP_JRNL_ENABLE_TESTMODE
-#define ESP_JRNL_TEST_STOP_SKIP_COMMIT              0x00000001  /* don't start commiting transaction (==leave it OPEN), and exit */
-#define ESP_JRNL_TEST_STOP_SET_COMMIT_AND_EXIT      0x00000002  /* start commiting transaction (== update the master record), and exit */
+#define ESP_JRNL_TEST_STOP_SKIP_COMMIT              0x00000001  /* don't start committing transaction (== leave it OPEN), and exit */
+#define ESP_JRNL_TEST_STOP_SET_COMMIT_AND_EXIT      0x00000002  /* start committing transaction (== update the master record), and exit */
 #define ESP_JRNL_TEST_REPLAY_ERASE_AND_EXIT         0x00000004  /* erase the first target sector within journaled data transfer, and exit */
 #define ESP_JRNL_TEST_REPLAY_WRITE_AND_EXIT         0x00000008  /* erase and write the first target sector within journaled data transfer, and exit */
 #define ESP_JRNL_TEST_REPLAY_EXIT_BEFORE_CLOSE      0x00000010  /* finish transferring all the journaled sectors but don't set the master status to READY, and exit */
+#define ESP_JRNL_TEST_REQUIRE_FILE_CLOSE            0x00000020  /* fclose()/close() operation required for given testing procedure */
+#define ESP_JRNL_TEST_SUSPEND_TRANSACTION           0x00000040  /* keeps jrnl_start/stop disabled, allows direct FS operations */
 #endif
 
 /**
- * @brief Debug printout of esp_jrnl_master_t record structure
+ * @brief Debug printout of esp_jrnl_instance_t record structure (master + all data headers, if any)
+ *
+ * @param[in] inst_ptr  jrnl instance record
  */
-void print_jrnl_master(esp_jrnl_master_t* jrnl_master);
+void print_jrnl_instance(esp_jrnl_instance_t* inst_ptr);
+
+/**
+ * @brief Debug printout of esp_jrnl_master_t record structure
+ *
+ * @param[in] jrnl_master  jrnl master record instance
+ */
+void print_jrnl_master(const esp_jrnl_master_t* jrnl_master);
 
 /**
  * @brief Debug printout of esp_jrnl_config_extended_t record structure
+ *
+ * @param[in] config  jrnl extended configuration record instance
  */
 void print_jrnl_config_extended(const esp_jrnl_config_extended_t *config);
 
@@ -154,14 +168,14 @@ esp_err_t jrnl_write_internal(esp_jrnl_instance_t* inst_ptr, const uint8_t *buff
  * Other fields remain untouched.
  *
  * @param inst_ptr  FS journal instance pointer
- * @param init  flag to distinguish between initial state (FS mount, format) and ready state (JRNL transaction ready)
+ * @param fs_direct  flag to distinguish between (initial) file-system direct access (FS mount, format, etc) and journaling-on state (JRNL transaction ready)
  *
  * @return
  *      - ESP_OK on success
  *      - ESP_ERR_INVALID_ARG on 'jrnl' instance being NULL
  *      - errors returned by jrnl_write_internal()
  */
-esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool init);
+esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool fs_direct);
 
 /**
  * @brief Applies all the operations stored in the FS journal log in the same order as they appeared.

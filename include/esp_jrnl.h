@@ -150,7 +150,7 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit);
 /**
  * @brief Updates journal master record status to switch between direct disk access and the journaled one
  *
- * Sets master.status record of journal instance given by 'handle' to ESP_JRNL_STATUS_FS_INIT for 'direct' = true,
+ * Sets master.status record of journal instance given by 'handle' to ESP_JRNL_STATUS_FS_DIRECT for 'direct_access' = true,
  * and to ESP_JRNL_STATUS_TRANS_READY on false, applicable only when the status is one of the two states.
  * This status allows direct I/O access to the target disk, ie it bypasses the journaling mechanism.
  * Needed for file-system mounting, formatting or similar operations.
@@ -159,14 +159,14 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit);
  * @note So far, direct disk access is applied only within jrnl_write API
  *
  * @param handle  FS journal instance handle
- * @param init  'true' - use direct access, 'false'- use journaled access
+ * @param direct_access  'true' - use direct access, 'false'- use journaled access
  *
  * @return
  *      - ESP_OK on success
  *      - ESP_ERR_INVALID_ARG if vfs argument is NULL
  *      - ESP_ERR_INVALID_STATE if transaction is in progress
  */
-esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct);
+esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct_access);
 
 /**
  * @brief Gets handle to the target disk operation driver instance (eg wl_handle for WL-partition).
@@ -216,9 +216,9 @@ esp_err_t esp_jrnl_get_sector_size(const esp_jrnl_handle_t handle, size_t* secto
  * journal store instance given by 'handle'. Each such a journaled chunk occupies one extra sector filled with
  * related 'header' data (CRC32s of the data and the header's items, original target sector and sector count).
  *
- * If no transaction is available and the FS journal store status is ESP_JRNL_STATUS_FS_INIT, the operation is
- * propagated directly to the target disk with original parameters (useful for mounting, formatting and other file-system
- * maintenance operations).
+ * If no transaction is available and the FS journal store status is ESP_JRNL_STATUS_FS_DIRECT (or ESP_JRNL_STATUS_FS_INIT),
+ * the operation is propagated directly to the target disk with original parameters (useful for testing, mounting, formatting
+ * and other file-system maintenance operations).
  *
  * In all other cases esp_jrnl_write() fails.
  *

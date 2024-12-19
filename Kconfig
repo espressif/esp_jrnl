@@ -1,9 +1,15 @@
 menu "ESP File System journaling"
 
     config ESP_JRNL_ENABLE_TESTMODE
-        bool
-        default y
+        bool "Enable built-in test configurations"
+        default n
         help
-            Hidden option for the component tests (enables built-in test configurations)
+            Enable deplopyment of built-in test configuration for test_apps
+
+    config ESP_JRNL_DEBUG_PRINT
+        bool "Enable debug printouts"
+        default n
+        help
+            Enable debug printouts. Useful for 'jrnl_master' contents check
 
 endmenu # esp_jrnl
