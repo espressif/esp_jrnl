@@ -13,10 +13,21 @@ Furthermore, these tests operate at sector level, without any knowledge of the d
 Testing procedures use own data strings and offsets, erase and rewrite various sectors and are generally careless about structures possibly existing
 on the test disk before the test suite start.
 
-FatFS/VFS aware test parts are implemented in the 'jrnl_vfs' application.
-
 NOTE:
 All the 'esp_jrnl' tests are chip-type agnostic, the only parameter required is default SPI Flash chip with minimum 2MB of available space (test app default flash size is 4MB).
 
-To run the test all-in-one, use 'pytest' (see https://docs.espressif.com/projects/esp-idf/en/stable/esp32/contribute/esp-idf-tests-with-pytest.html).
+To run the test all-in-one, use 'pytest' (see https://docs.espressif.com/projects/esp-idf/en/stable/esp32/contribute/esp-idf-tests-with-pytest.html). For example, to run the tests on ESP32S3, do the following: 
+
+```
+    cd esp-idf
+    git pull
+    git submodule update --init --recursive
+    cd ../esp_jrnl
+    ../esp-idf/install.sh --enable-pytest
+    . ../esp-idf/export.sh
+    cd test_apps/jrnl_basic
+    idf.py set-target esp32s3
+    idf.py build
+    pytest
+```
 
