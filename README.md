@@ -37,7 +37,7 @@ The above-mentioned process minimises corruption-prone period of the file-system
 Due to its extensive use of specific disk area, **esp_jrnl** should be installed only on wear-levelled media. The FatFS version is primarily targeted on SPI FLash and automatically deploys the IDF wear-levelling component.
 
 Basic journaling unit is a sector of the same size as given by related file system - the data are stored per blocks of this size. Also, the metadata records occupy one sector each. The main information pack is called 'master record' and it is always the last sector in the store, to allow straightforward readout of the **esp_jrnl** store details for given partition. The rest of the store (data blocks + metadata) are indexed from the store's sector 0:
-
+```
     |--------------------------------------------------------------------||------------|---||------|
     |                                                                    ||            | M ||      |
     |                                                                    ||            | A ||      |
@@ -56,6 +56,7 @@ Basic journaling unit is a sector of the same size as given by related file syst
     |--------------------------------------------------------------------||----------------||------|
     |<--------  - - -                  - - - PARTITION SPACE - - -                 - - -  -------->|
     |----------------------------------------------------------------------------------------------|
+```
 
 Basic **esp_jrnl** configuration is given the following structure:
 
