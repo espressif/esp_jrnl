@@ -1,4 +1,4 @@
-version: "1.0.2"
+version: "1.0.3"
 description: ESP-IDF file-system journaling layer (FatFS over SPI Flash)
 url: https://components.espressif.com/components/espressif/esp_jrnl
 repository: https://github.com/espressif/esp_jrnl
