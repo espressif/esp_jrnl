@@ -9,6 +9,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/lock.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_err.h"
 #include "esp_jrnl.h"
 #include "sdkconfig.h"
@@ -64,6 +67,10 @@ typedef struct {
  */
 typedef struct {
     _lock_t trans_lock;
+    /* [mass-production fix #5] recursive mutex serializing a whole transaction window
+     * (esp_jrnl_start .. FS op .. esp_jrnl_stop) against concurrent tasks using the same mount.
+     * Distinct from trans_lock, which only guards the short master-record critical sections. */
+    SemaphoreHandle_t trans_owner_lock;
     uint8_t fs_volume_id;                   /* file-system volume ID (PDRV for FatFS) */
     esp_jrnl_diskio_t diskio;               /* disk device access configuration */
     esp_jrnl_master_t master;               /* journal master record for given instance */
