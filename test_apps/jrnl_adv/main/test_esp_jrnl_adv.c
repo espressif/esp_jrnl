@@ -7,6 +7,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include "unity.h"
 #include "esp_vfs_jrnl_fat.h"
 #include "esp_jrnl_internal.h"
