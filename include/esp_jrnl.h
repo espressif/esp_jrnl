@@ -122,11 +122,12 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle);
  * (status changed to ESP_JRNL_STATUS_TRANS_OPEN), all subsequent disk-write operations originated in the journaled file-system are written to the FS store first,
  * unless esp_jrnl_stop() is called for appropriate FS journal instance handle.
  *
- * @note esp_jrnl_start() acquires a per-instance transaction-owner mutex which is held until the paired esp_jrnl_stop().
- *       This serializes the whole start..stop window, so concurrent file operations from several tasks on the same mount
- *       are queued instead of failing/colliding. esp_jrnl_unmount()/esp_jrnl_set_direct_io() take the same mutex and thus
- *       wait for any in-flight transaction. Note that destroying a mount (unmount) while another task is still issuing
- *       file operations on it remains a caller responsibility - stop all FS access to a mount before unmounting it.
+ * @note esp_jrnl_start() acquires a per-instance recursive C-library lock (@c _lock_t from @c <sys/lock.h>)
+ *       which is held until the paired esp_jrnl_stop(). This serializes the whole start..stop window, so
+ *       concurrent file operations from several tasks on the same mount are queued instead of failing/colliding.
+ *       esp_jrnl_unmount()/esp_jrnl_set_direct_io() take the same lock and thus wait for any in-flight
+ *       transaction. Note that destroying a mount (unmount) while another task is still issuing file operations
+ *       on it remains a caller responsibility - stop all FS access to a mount before unmounting it.
  *
  * @param handle  FS journal instance handle
  *

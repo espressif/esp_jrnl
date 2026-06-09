@@ -13,8 +13,6 @@
 #include <sys/lock.h>
 
 #include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_crc.h"
 #include "esp_jrnl_internal.h"
@@ -138,12 +136,9 @@ static void jrnl_delete_instance(esp_jrnl_instance_t* inst_ptr)
     if (inst_ptr == NULL) {
         return;
     }
-    /* [mass-production fix #5] the owner mutex must be unheld here; esp_jrnl_unmount() takes
-     * and gives it back (after detaching the instance) before calling this function */
-    if (inst_ptr->trans_owner_lock != NULL) {
-        vSemaphoreDelete(inst_ptr->trans_owner_lock);
-        inst_ptr->trans_owner_lock = NULL;
-    }
+    /* [mass-production fix #5] the owner lock must be unheld here; esp_jrnl_unmount() releases
+     * it (after detaching the instance) before calling this function */
+    _lock_close_recursive(&inst_ptr->trans_owner_lock);
     _lock_close(&inst_ptr->trans_lock);
     free(inst_ptr);
     inst_ptr = NULL;
@@ -452,12 +447,8 @@ esp_err_t esp_jrnl_mount(const esp_jrnl_config_extended_t *config, esp_jrnl_hand
 
         //init the instance
         _lock_init(&jrnl->trans_lock);
-        //[mass-production fix #5] per-instance transaction-owner mutex (serializes whole start..stop windows)
-        jrnl->trans_owner_lock = xSemaphoreCreateRecursiveMutex();
-        if (jrnl->trans_owner_lock == NULL) {
-            err = ESP_ERR_NO_MEM;
-            break;
-        }
+        /* [mass-production fix #5] per-instance transaction-owner lock (serializes whole start..stop windows) */
+        _lock_init_recursive(&jrnl->trans_owner_lock);
         jrnl->fs_volume_id = config->fs_volume_id;
         jrnl->diskio = config->diskio_cfg;
 
@@ -551,11 +542,11 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle)
 
     /* [mass-production fix #5] block until any in-flight transaction on this mount finishes and
      * prevent a new one from starting, so we never free the instance from under an active task.
-     * The mutex is given back before jrnl_delete_instance() deletes it. */
+     * The owner lock is released before jrnl_delete_instance() tears it down. */
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
-    xSemaphoreTakeRecursive(inst_ptr->trans_owner_lock, portMAX_DELAY);
+    _lock_acquire_recursive(&inst_ptr->trans_owner_lock);
     s_jrnl_instance_ptrs[handle] = NULL;
-    xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);
+    _lock_release_recursive(&inst_ptr->trans_owner_lock);
 
     jrnl_delete_instance(inst_ptr);
 
@@ -576,10 +567,10 @@ esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     JRNL_TEST_TRANSACTION_SUSPENDED("esp_jrnl_start() suspended");
 
-    /* [mass-production fix #5] acquire the transaction-owner mutex for the whole start..stop window.
+    /* [mass-production fix #5] acquire the transaction-owner lock for the whole start..stop window.
      * It is released by esp_jrnl_stop() on success, or here on any failure (esp_jrnl_stop() is only
      * called by the callers when esp_jrnl_start() returned ESP_OK). */
-    xSemaphoreTakeRecursive(inst_ptr->trans_owner_lock, portMAX_DELAY);
+    _lock_acquire_recursive(&inst_ptr->trans_owner_lock);
 
     _lock_acquire(&inst_ptr->trans_lock);
 
@@ -605,7 +596,7 @@ esp_err_t esp_jrnl_start(const esp_jrnl_handle_t handle)
     _lock_release(&inst_ptr->trans_lock);
 
     if (err != ESP_OK) {
-        xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);   /* [mass-production fix #5] no paired esp_jrnl_stop() on failure */
+        _lock_release_recursive(&inst_ptr->trans_owner_lock);   /* [mass-production fix #5] no paired esp_jrnl_stop() on failure */
     }
 
     return err;
@@ -631,7 +622,7 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit)
         _lock_acquire(&inst_ptr->trans_lock);
         err = jrnl_reset_master(inst_ptr, false);
         _lock_release(&inst_ptr->trans_lock);
-        xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
+        _lock_release_recursive(&inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
         return err;
     }
 
@@ -651,7 +642,7 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit)
 
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "jrnl_write_internal failed (0x%08X)", err);
-            xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
+            _lock_release_recursive(&inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
             return err;
         }
 
@@ -663,7 +654,7 @@ esp_err_t esp_jrnl_stop(const esp_jrnl_handle_t handle, const bool commit)
         ESP_LOGE(TAG, "Journaling transaction not open (0x%08X)", err);
     }
 
-    xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
+    _lock_release_recursive(&inst_ptr->trans_owner_lock);   /* [mass-production fix #5] end of transaction window */
 
     return err;
 }
@@ -729,7 +720,7 @@ esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct_acc
 
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     /* [mass-production fix #5] serialize against any in-flight transaction window */
-    xSemaphoreTakeRecursive(inst_ptr->trans_owner_lock, portMAX_DELAY);
+    _lock_acquire_recursive(&inst_ptr->trans_owner_lock);
     _lock_acquire(&inst_ptr->trans_lock);
 
     //direct FS access switching cannot be required during a transaction lifetime
@@ -741,7 +732,7 @@ esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct_acc
         err = jrnl_update_master(inst_ptr, &inst_ptr->master);
     }
     _lock_release(&inst_ptr->trans_lock);
-    xSemaphoreGiveRecursive(inst_ptr->trans_owner_lock);
+    _lock_release_recursive(&inst_ptr->trans_owner_lock);
 
     return err;
 }
