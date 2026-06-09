@@ -130,6 +130,14 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
                 break;
             }
 
+            /* f_mkfs writes the whole volume; bypass the journal store for the format pass. */
+            result = esp_jrnl_set_direct_io(jrnl_handle_temp, true);
+            if (result != ESP_OK) {
+                ff_memfree(workbuf);
+                ESP_LOGE(TAG, "esp_jrnl_set_direct_io(true) before f_mkfs failed for pdrv=%i, error: 0x%08X", pdrv, result);
+                break;
+            }
+
             size_t alloc_unit_size = esp_vfs_fat_get_allocation_unit_size(CONFIG_WL_SECTOR_SIZE, mount_config->allocation_unit_size);
             ESP_LOGD(TAG, "Formatting FATFS partition (allocation unit size=%d)", alloc_unit_size);
 

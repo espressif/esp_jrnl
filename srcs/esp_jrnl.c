@@ -542,9 +542,19 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle)
 
     /* [mass-production fix #5] block until any in-flight transaction on this mount finishes and
      * prevent a new one from starting, so we never free the instance from under an active task.
-     * The owner lock is released before jrnl_delete_instance() tears it down. */
+     * The owner lock is fully released before jrnl_delete_instance() tears it down. */
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     _lock_acquire_recursive(&inst_ptr->trans_owner_lock);
+
+    if (inst_ptr->master.status == ESP_JRNL_STATUS_TRANS_OPEN ||
+            inst_ptr->master.status == ESP_JRNL_STATUS_TRANS_COMMIT) {
+        _lock_acquire(&inst_ptr->trans_lock);
+        (void)jrnl_reset_master(inst_ptr, false);
+        _lock_release(&inst_ptr->trans_lock);
+        /* Same task may still hold the owner lock from esp_jrnl_start(); mirror esp_jrnl_stop(). */
+        _lock_release_recursive(&inst_ptr->trans_owner_lock);
+    }
+
     s_jrnl_instance_ptrs[handle] = NULL;
     _lock_release_recursive(&inst_ptr->trans_owner_lock);
 
