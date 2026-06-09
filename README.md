@@ -98,6 +98,7 @@ During the application runtime, each partition has 1 journal instance defined by
 ```c
 typedef struct {
     _lock_t trans_lock;
+    _lock_t trans_owner_lock;               /* recursive lock: whole transaction window (start..stop) */
     uint8_t fs_volume_id;                   /* file-system volume ID (PDRV for FatFS) */
     esp_jrnl_diskio_t diskio;               /* disk device access configuration */
     esp_jrnl_master_t master;               /* journal master record for given instance */

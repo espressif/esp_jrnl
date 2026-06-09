@@ -411,7 +411,12 @@ static ssize_t vfs_fat_pwrite(void *ctx, int fd, const void *src, size_t size, o
     f_res = f_write(file, src, size, &wr);
     if (((wr == 0) && (size != 0)) && (f_res == 0)) {
         errno = ENOSPC;
-        return -1;
+        ret = -1;
+        FRESULT seek_res = f_lseek(file, prev_pos);
+        if (seek_res != FR_OK) {
+            ESP_LOGE(TAG, "%s: f_lseek restore after ENOSPC write failed (fresult=%d)", __func__, seek_res);
+        }
+        goto pwrite_release;   /* [mass-production fix #3] release fat_ctx->lock on the disk-full path */
     }
     if (f_res == FR_OK) {
         ret = wr;
@@ -830,7 +835,7 @@ static void vfs_fat_seekdir(void* ctx, DIR* pdir, long offset)
         if (res != FR_OK) {
             ESP_LOGD(TAG, "%s: rewinddir fresult=%d", __func__, res);
             errno = fresult_to_errno(res);
-            return;
+            goto seekdir_done;   /* [mass-production fix #4] release fat_ctx->lock on error */
         }
         fat_dir->offset = 0;
     }
@@ -839,10 +844,11 @@ static void vfs_fat_seekdir(void* ctx, DIR* pdir, long offset)
         if (res != FR_OK) {
             ESP_LOGD(TAG, "%s: f_readdir fresult=%d", __func__, res);
             errno = fresult_to_errno(res);
-            return;
+            goto seekdir_done;   /* [mass-production fix #4] release fat_ctx->lock on error */
         }
         fat_dir->offset++;
     }
+seekdir_done:
     _lock_release(&fat_ctx->lock);
 }
 
@@ -1381,9 +1387,8 @@ static struct dirent* vfs_fat_readdir_jrnl(void* ctx, DIR* pdir)
     struct dirent* out_dirent = vfs_fat_readdir(ctx, pdir);
 
     if (esp_jrnl_stop(jrnl_handle, out_dirent != NULL) != ESP_OK) {
-        if(out_dirent) {
-            free(out_dirent);
-        }
+        /* [mass-production fix #6] out_dirent points into the heap-allocated vfs_fat_dir_t
+         * (its cur_dirent member), it is NOT a separately malloc'd block - must not be free()d */
         out_dirent = NULL;
         errno = EBADF;
     }
