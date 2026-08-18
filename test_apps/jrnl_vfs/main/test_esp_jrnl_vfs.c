@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -7,11 +7,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <sys/time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <errno.h>
 #include <utime.h>
 #include "unity.h"
@@ -412,6 +414,119 @@ TEST(jrnl_vfs_fat, jrnl_mkdir_rmdir)
     test_teardown_no_jrnl();
 }
 
+static bool test_readdir_find(DIR *dir, const char *name)
+{
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (strcasecmp(de->d_name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST(jrnl_vfs_fat, jrnl_opendir_readdir)
+{
+    char dir_a[64];
+    char dir_b[64];
+    char file_a[64];
+    char file_b[64];
+    snprintf(dir_a, sizeof(dir_a), "%s/%s", s_basepath, "dirA");
+    snprintf(dir_b, sizeof(dir_b), "%s/%s", s_basepath, "dirB");
+    snprintf(file_a, sizeof(file_a), "%s/%s", dir_a, "a.txt");
+    snprintf(file_b, sizeof(file_b), "%s/%s", dir_b, "a.txt");
+
+    test_setup_jrnl(NULL);
+
+    TEST_ASSERT_EQUAL(0, mkdir(dir_a, 0777));
+    TEST_ASSERT_EQUAL(0, mkdir(dir_b, 0777));
+
+    FILE *f = fopen(file_a, "w+");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT(fwrite("AAAA", 4, 1, f) > 0);
+    TEST_ASSERT(fclose(f) == 0);
+
+    f = fopen(file_b, "w+");
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT(fwrite("BBBBBBBB", 8, 1, f) > 0);
+    TEST_ASSERT(fclose(f) == 0);
+
+    DIR *d_a = opendir(dir_a);
+    TEST_ASSERT_NOT_NULL(d_a);
+    TEST_ASSERT_TRUE(test_readdir_find(d_a, "a.txt"));
+    TEST_ASSERT_EQUAL(0, closedir(d_a));
+
+    struct stat st;
+    TEST_ASSERT_EQUAL(0, stat(file_a, &st));
+    TEST_ASSERT(st.st_size == 4);
+    TEST_ASSERT_EQUAL(0, stat(file_b, &st));
+    TEST_ASSERT(st.st_size == 8);
+
+    /* Per-DIR readdir/stat cache: listing dirA must not poison stat of dirB. */
+    d_a = opendir(dir_a);
+    DIR *d_b = opendir(dir_b);
+    TEST_ASSERT_NOT_NULL(d_a);
+    TEST_ASSERT_NOT_NULL(d_b);
+    TEST_ASSERT_TRUE(test_readdir_find(d_a, "a.txt"));
+    TEST_ASSERT_EQUAL(0, stat(file_b, &st));
+    TEST_ASSERT(st.st_size == 8);
+    TEST_ASSERT_EQUAL(0, closedir(d_a));
+    TEST_ASSERT_EQUAL(0, closedir(d_b));
+
+    test_teardown_jrnl();
+
+    test_setup_no_jrnl();
+    d_a = opendir(dir_a);
+    TEST_ASSERT_NOT_NULL(d_a);
+    TEST_ASSERT_TRUE(test_readdir_find(d_a, "a.txt"));
+    TEST_ASSERT_EQUAL(0, closedir(d_a));
+    TEST_ASSERT_EQUAL(0, stat(file_a, &st));
+    TEST_ASSERT(st.st_size == 4);
+    TEST_ASSERT_EQUAL(0, stat(file_b, &st));
+    TEST_ASSERT(st.st_size == 8);
+    test_teardown_no_jrnl();
+}
+
+TEST(jrnl_vfs_fat, jrnl_fcntl)
+{
+    char test_file_name[64] = {0};
+    snprintf(test_file_name, sizeof(test_file_name), "%s/%s", s_basepath, "fcntl.txt");
+
+    test_setup_jrnl(NULL);
+
+    int fd = open(test_file_name, O_RDWR | O_CREAT | O_TRUNC);
+    TEST_ASSERT_NOT_EQUAL(fd, -1);
+
+    int flags = fcntl(fd, F_GETFL);
+    TEST_ASSERT_NOT_EQUAL(flags, -1);
+    TEST_ASSERT((flags & O_ACCMODE) == O_RDWR);
+    TEST_ASSERT((flags & O_APPEND) == 0);
+
+    const char first[] = "AAAA";
+    TEST_ASSERT_NOT_EQUAL(write(fd, first, sizeof(first) - 1), -1);
+    TEST_ASSERT_NOT_EQUAL(lseek(fd, 0, SEEK_SET), -1);
+
+    TEST_ASSERT_EQUAL(0, fcntl(fd, F_SETFL, flags | O_APPEND));
+    flags = fcntl(fd, F_GETFL);
+    TEST_ASSERT_NOT_EQUAL(flags, -1);
+    TEST_ASSERT(flags & O_APPEND);
+
+    const char second[] = "BBBB";
+    TEST_ASSERT_NOT_EQUAL(write(fd, second, sizeof(second) - 1), -1);
+    TEST_ASSERT_EQUAL(0, close(fd));
+
+    test_teardown_jrnl();
+
+    test_setup_no_jrnl();
+    fd = open(test_file_name, O_RDONLY);
+    TEST_ASSERT_NOT_EQUAL(fd, -1);
+    char buf[16] = {0};
+    TEST_ASSERT_EQUAL(8, read(fd, buf, sizeof(buf)));
+    TEST_ASSERT(memcmp(buf, "AAAABBBB", 8) == 0);
+    TEST_ASSERT_EQUAL(0, close(fd));
+    test_teardown_no_jrnl();
+}
+
 //create (any) record, don't finish the transaction, check the FS remains untouched
 TEST(jrnl_vfs_fat, jrnl_create_nocommit)
 {
@@ -452,6 +567,8 @@ TEST_GROUP_RUNNER(fs_journaling_vfs)
     RUN_TEST_CASE(jrnl_vfs_fat, jrnl_truncate_file);
     RUN_TEST_CASE(jrnl_vfs_fat, jrnl_utime);
     RUN_TEST_CASE(jrnl_vfs_fat, jrnl_mkdir_rmdir);
+    RUN_TEST_CASE(jrnl_vfs_fat, jrnl_opendir_readdir);
+    RUN_TEST_CASE(jrnl_vfs_fat, jrnl_fcntl);
 }
 
 void app_main(void)
