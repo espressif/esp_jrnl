@@ -431,10 +431,10 @@ TEST(jrnl_vfs_fat, jrnl_opendir_readdir)
     char dir_b[64];
     char file_a[64];
     char file_b[64];
-    snprintf(dir_a, sizeof(dir_a), "%s/%s", s_basepath, "dirA");
-    snprintf(dir_b, sizeof(dir_b), "%s/%s", s_basepath, "dirB");
-    snprintf(file_a, sizeof(file_a), "%s/%s", dir_a, "a.txt");
-    snprintf(file_b, sizeof(file_b), "%s/%s", dir_b, "a.txt");
+    snprintf(dir_a, sizeof(dir_a), "%s/dirA", s_basepath);
+    snprintf(dir_b, sizeof(dir_b), "%s/dirB", s_basepath);
+    snprintf(file_a, sizeof(file_a), "%s/dirA/a.txt", s_basepath);
+    snprintf(file_b, sizeof(file_b), "%s/dirB/a.txt", s_basepath);
 
     test_setup_jrnl(NULL);
 

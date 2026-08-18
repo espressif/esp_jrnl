@@ -227,8 +227,8 @@ static void file_cleanup(vfs_fat_ctx_t* ctx, int fd)
  * @note Call this function with ctx->lock acquired. Paths are valid while the
  *       lock is held.
  * @param ctx vfs_fat_ctx_t context
- * @param[inout] path as input, pointer to the path; as output, pointer to the new path
- * @param[inout] path2 as input, pointer to the path; as output, pointer to the new path
+ * @param[in,out] path as input, pointer to the path; as output, pointer to the new path
+ * @param[in,out] path2 as input, pointer to the path; as output, pointer to the new path
  */
 static void prepend_drive_to_path(vfs_fat_ctx_t * ctx, const char ** path, const char ** path2){
     snprintf(ctx->tmp_path_buf, sizeof(ctx->tmp_path_buf), "%s%s", ctx->fat_drive, *path);
