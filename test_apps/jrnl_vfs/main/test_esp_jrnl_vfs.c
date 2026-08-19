@@ -506,9 +506,11 @@ TEST(jrnl_vfs_fat, jrnl_fcntl)
     TEST_ASSERT_NOT_EQUAL(write(fd, first, sizeof(first) - 1), -1);
     TEST_ASSERT_NOT_EQUAL(lseek(fd, 0, SEEK_SET), -1);
 
-    TEST_ASSERT_EQUAL(0, fcntl(fd, F_SETFL, flags | O_APPEND));
+    /* F_SETFL must not clobber O_ACCMODE when arg is only a status flag. */
+    TEST_ASSERT_EQUAL(0, fcntl(fd, F_SETFL, O_APPEND));
     flags = fcntl(fd, F_GETFL);
     TEST_ASSERT_NOT_EQUAL(flags, -1);
+    TEST_ASSERT((flags & O_ACCMODE) == O_RDWR);
     TEST_ASSERT(flags & O_APPEND);
 
     const char second[] = "BBBB";
