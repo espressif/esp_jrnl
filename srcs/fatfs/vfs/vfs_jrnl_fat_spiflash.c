@@ -1,11 +1,13 @@
 /*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
@@ -15,6 +17,10 @@
 #include "../diskio/diskio_jrnl.h"
 #include "private_include/esp_vfs_jrnl_fat_private.h"
 #include "vfs_fat_internal.h"
+
+// If the available sectors based on partition size are less than 128,
+// the root directory sector should be set to 1.
+#define MIN_REQ_SEC    128
 
 static const char* TAG = "vfs_jrnl_fat_spiflash";
 
@@ -29,6 +35,13 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
     if (base_path == NULL || mount_config == NULL || jrnl_config == NULL || jrnl_handle == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+    if (mount_config->read_only && mount_config->format_if_mount_failed) {
+        ESP_LOGE(TAG, "read_only and format_if_mount_failed are mutually exclusive");
+        return ESP_ERR_INVALID_ARG;
+    }
+#endif
 
     //find required partition
     const esp_partition_t *jrnl_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, partition_label);
@@ -110,15 +123,29 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
         if (!need_mount_again) {
             FRESULT fres = f_mount(fs, drv, 1);
             if (fres != FR_OK) {
-                need_mount_again =
-                        (fres == FR_NO_FILESYSTEM || fres == FR_INT_ERR) && mount_config->format_if_mount_failed;
+                const char *msg = "Unknown";
+                const char *note = "";
+                bool recoverable = false;
+                switch (fres) {
+                    case FR_NO_FILESYSTEM:
+                        msg = "No filesystem detected";
+                        note = "(This may indicate corrupt FS, or attempt to mount read-only fatfsgen image for write)";
+                        recoverable = true;
+                        break;
+                    case FR_INT_ERR:
+                        msg = "Assertion failed";
+                        recoverable = true;
+                        break;
+                    default:
+                        break;
+                }
+                need_mount_again = recoverable && mount_config->format_if_mount_failed;
                 if (!need_mount_again) {
-                    ESP_LOGE(TAG, "f_mount failed (%d)", fres);
+                    ESP_LOGE(TAG, "f_mount failed with error: \"%s\" [%d]. %s", msg, fres, note);
                     result = ESP_FAIL;
                     break;
-                } else {
-                    ESP_LOGD(TAG, "No file-system found");
                 }
+                ESP_LOGW(TAG, "FatFS mount (f_mount) failed with error: \"%s\" [%d]. Retrying after format...", msg, fres);
             }
         }
 
@@ -141,7 +168,21 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
             size_t alloc_unit_size = esp_vfs_fat_get_allocation_unit_size(CONFIG_WL_SECTOR_SIZE, mount_config->allocation_unit_size);
             ESP_LOGD(TAG, "Formatting FATFS partition (allocation unit size=%d)", alloc_unit_size);
 
-            const MKFS_PARM opt = {(BYTE)(FM_ANY | FM_SFD), 0, 0, 0, alloc_unit_size};
+            UINT root_dir_entries;
+            if (CONFIG_WL_SECTOR_SIZE == 512) {
+                root_dir_entries = 16;
+            } else {
+                root_dir_entries = 128;
+            }
+            size_t sec_num = 0;
+            result = esp_jrnl_get_sector_count(jrnl_handle_temp, &sec_num);
+            if (result != ESP_OK) {
+                ff_memfree(workbuf);
+                ESP_LOGE(TAG, "esp_jrnl_get_sector_count failed for pdrv=%i, error: 0x%08X", pdrv, result);
+                break;
+            }
+            const MKFS_PARM opt = {(BYTE)(FM_ANY | FM_SFD), (mount_config->use_one_fat ? 1 : 2), 0,
+                                   (sec_num <= MIN_REQ_SEC ? root_dir_entries : 0), alloc_unit_size};
             FRESULT fresult = f_mkfs(drv, &opt, workbuf, workbuf_size);
 
             ff_memfree(workbuf);
@@ -154,7 +195,7 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
             }
 
             ESP_LOGD(TAG, "Formatting done, mounting the volume");
-            fresult = f_mount(fs, drv, 0);
+            fresult = f_mount(fs, drv, 1);
             if (fresult != FR_OK) {
                 ESP_LOGE(TAG, "f_mount after (re)format failed (%d)", fresult);
                 result = ESP_FAIL;
@@ -168,6 +209,16 @@ esp_err_t esp_vfs_fat_spiflash_mount_jrnl(const char* base_path,
             ESP_LOGE(TAG, "esp_jrnl_set_direct_io failed for pdrv=%i, error: 0x%08X", pdrv, result);
             break;
         }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 2, 0)
+        if (jrnl_partition->readonly || mount_config->read_only) {
+            result = esp_vfs_set_readonly_flag(base_path);
+            if (result != ESP_OK) {
+                ESP_LOGE(TAG, "esp_vfs_set_readonly_flag failed for pdrv=%i, error: 0x%08X", pdrv, result);
+                break;
+            }
+        }
+#endif
     } while(0);
 
     if (result == ESP_OK) {

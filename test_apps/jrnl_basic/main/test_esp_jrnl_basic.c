@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2024 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2024-2026 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -24,7 +24,7 @@
 #include "esp_crc.h"
 
 static const char* TAG = "test_esp_jrnl_basic";
-static esp_jrnl_handle_t s_jrnl_handle;
+static esp_jrnl_handle_t s_jrnl_handle = JRNL_INVALID_HANDLE;
 extern esp_jrnl_instance_t* s_jrnl_instance_ptrs[JRNL_MAX_HANDLES];
 
 const char* s_basepath = "/spiflash";
@@ -33,22 +33,33 @@ const char* s_partlabel = "jrnl";
 static uint8_t* s_buf_write = NULL;
 static uint8_t* s_buf_read = NULL;
 
-static void test_setup(void)
+static esp_err_t test_mount_jrnl_err(bool format_if_mount_failed, bool force_fs_format, bool overwrite_existing,
+                                    esp_jrnl_handle_t *handle)
 {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-            .format_if_mount_failed = true,
+            .format_if_mount_failed = format_if_mount_failed,
             .max_files = 5
     };
 
     esp_jrnl_config_t jrnl_config = {
-        .overwrite_existing = true,
-        .force_fs_format = true,
-        .replay_journal_after_mount = false,
-        .store_size_sectors = 32
+            .overwrite_existing = overwrite_existing,
+            .force_fs_format = force_fs_format,
+            .replay_journal_after_mount = false,
+            .store_size_sectors = 32
     };
 
+    return esp_vfs_fat_spiflash_mount_jrnl(s_basepath, s_partlabel, &mount_config, &jrnl_config, handle);
+}
+
+static void test_mount_jrnl(bool format_if_mount_failed, bool force_fs_format, bool overwrite_existing)
+{
+    TEST_ESP_OK(test_mount_jrnl_err(format_if_mount_failed, force_fs_format, overwrite_existing, &s_jrnl_handle));
+}
+
+static void test_setup(void)
+{
     ESP_LOGV(TAG, "test_setup: esp_vfs_fat_spiflash_mount_rw_wl_jrnl(%s, %s)", s_basepath, s_partlabel);
-    TEST_ESP_OK(esp_vfs_fat_spiflash_mount_jrnl(s_basepath, s_partlabel, &mount_config, &jrnl_config, &s_jrnl_handle));
+    test_mount_jrnl(true, true, true);
 }
 
 static void test_teardown(void)
@@ -83,6 +94,42 @@ static void test_memset_pattern(const uint8_t* pattern, const size_t pattern_siz
     for (uint8_t *offset = out_buffer; offset < (out_buffer+out_buffer_size-pattern_size); offset += pattern_size) {
         memcpy((void*)offset, (const void*)pattern, pattern_size);
     }
+}
+
+static void test_assert_jrnl_ready(void)
+{
+    TEST_ESP_OK(jrnl_check_handle(s_jrnl_handle, __func__));
+
+    esp_jrnl_master_t jrnl_master;
+    TEST_ESP_OK(test_get_jrnl_master(s_jrnl_handle, &jrnl_master));
+    TEST_ASSERT(jrnl_master.jrnl_magic_mark == JRNL_STORE_MARKER);
+    TEST_ASSERT(jrnl_master.status == ESP_JRNL_STATUS_TRANS_READY);
+}
+
+/* Start/cancel an empty transaction: fails if mount left the store in FS_DIRECT. */
+static void test_jrnl_empty_transaction(void)
+{
+    TEST_ESP_OK(esp_jrnl_start(s_jrnl_handle));
+    TEST_ESP_OK(esp_jrnl_stop(s_jrnl_handle, false));
+    test_assert_jrnl_ready();
+}
+
+/* Direct-write the FAT boot sector so the next f_mount fails, journal store left intact. */
+static void test_destroy_filesystem(void)
+{
+    TEST_ESP_OK(esp_jrnl_set_direct_io(s_jrnl_handle, true));
+
+    esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[s_jrnl_handle];
+    TEST_ASSERT_NOT_NULL(inst_ptr);
+    size_t sector_size = inst_ptr->master.volume.disk_sector_size;
+    TEST_ASSERT(sector_size > 0);
+
+    uint8_t *zeros = (uint8_t*)calloc(1, sector_size);
+    TEST_ASSERT_NOT_NULL(zeros);
+    TEST_ESP_OK(esp_jrnl_write(s_jrnl_handle, zeros, 0, 1));
+    free(zeros);
+
+    TEST_ESP_OK(esp_jrnl_set_direct_io(s_jrnl_handle, false));
 }
 
 
@@ -244,26 +291,76 @@ TEST(jrnl_basic, jrnl_start)
 
 TEST(jrnl_basic, jrnl_mount_unmount)
 {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-            .format_if_mount_failed = true,
-            .max_files = 5
-    };
-
-    esp_jrnl_config_t jrnl_config = {
-            .overwrite_existing = true,
-            .force_fs_format = true,
-            .replay_journal_after_mount = false,
-            .store_size_sectors = 32
-    };
-
-    TEST_ESP_OK(esp_vfs_fat_spiflash_mount_jrnl(s_basepath, s_partlabel, &mount_config, &jrnl_config, &s_jrnl_handle));
+    test_mount_jrnl(true, true, true);
+    test_assert_jrnl_ready();
     TEST_ESP_OK(esp_vfs_fat_spiflash_unmount_jrnl(&s_jrnl_handle, s_basepath));
     TEST_ASSERT(s_jrnl_handle == JRNL_INVALID_HANDLE);
 
-    jrnl_config.overwrite_existing = false;
-    jrnl_config.force_fs_format = false;
-    TEST_ESP_OK(esp_vfs_fat_spiflash_mount_jrnl(s_basepath, s_partlabel, &mount_config, &jrnl_config, &s_jrnl_handle));
+    /* Remount the same path with the existing journal/FS; do not format or overwrite. */
+    test_mount_jrnl(false, false, false);
+    test_assert_jrnl_ready();
+
+    esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[s_jrnl_handle];
+    TEST_ASSERT_NOT_NULL(inst_ptr);
+    size_t sector_size = inst_ptr->master.volume.disk_sector_size;
+    TEST_ASSERT(sector_size > 0);
+
+    s_buf_write = (uint8_t*)calloc(1, sector_size);
+    TEST_ASSERT(s_buf_write);
+    s_buf_read = (uint8_t*)calloc(1, sector_size);
+    TEST_ASSERT(s_buf_read);
+
+    const uint8_t buff_pattern[] = "ABCDEFGHABCDEFGH";
+    size_t test_target_sector = 12;
+    test_memset_pattern(buff_pattern, sizeof(buff_pattern), s_buf_write, sector_size);
+
+    TEST_ESP_OK(esp_jrnl_start(s_jrnl_handle));
+    TEST_ESP_OK(esp_jrnl_write(s_jrnl_handle, s_buf_write, test_target_sector, 1));
+    TEST_ESP_OK(esp_jrnl_stop(s_jrnl_handle, true));
+    TEST_ESP_OK(esp_jrnl_read(s_jrnl_handle, test_target_sector, s_buf_read, 1));
+    TEST_ASSERT(memcmp(s_buf_read, s_buf_write, sector_size) == 0);
+    test_assert_jrnl_ready();
+
     TEST_ESP_OK(esp_vfs_fat_spiflash_unmount_jrnl(&s_jrnl_handle, s_basepath));
+    TEST_ASSERT(s_jrnl_handle == JRNL_INVALID_HANDLE);
+}
+
+TEST(jrnl_basic, jrnl_force_fs_format)
+{
+    test_mount_jrnl(false, true, true);
+    test_assert_jrnl_ready();
+    test_jrnl_empty_transaction();
+    test_teardown();
+
+    /* force_fs_format reformats the volume and must leave the journal trans-ready, not FS_DIRECT. */
+    test_mount_jrnl(false, true, false);
+    test_assert_jrnl_ready();
+    test_jrnl_empty_transaction();
+    test_teardown();
+}
+
+TEST(jrnl_basic, jrnl_format_if_mount_failed)
+{
+    test_mount_jrnl(true, true, true);
+    test_destroy_filesystem();
+    test_teardown();
+
+    /* f_mount fails; format_if_mount_failed formats via direct I/O and restores TRANS_READY. */
+    test_mount_jrnl(true, false, false);
+    test_assert_jrnl_ready();
+    test_jrnl_empty_transaction();
+    test_teardown();
+}
+
+TEST(jrnl_basic, jrnl_format_disabled_fails)
+{
+    test_mount_jrnl(true, true, true);
+    test_destroy_filesystem();
+    test_teardown();
+
+    esp_jrnl_handle_t failed_handle = JRNL_INVALID_HANDLE;
+    TEST_ASSERT(test_mount_jrnl_err(false, false, false, &failed_handle) == ESP_FAIL);
+    TEST_ASSERT(failed_handle == JRNL_INVALID_HANDLE);
     TEST_ASSERT(s_jrnl_handle == JRNL_INVALID_HANDLE);
 }
 
@@ -424,6 +521,9 @@ TEST_GROUP_RUNNER(fs_journaling_basic)
     RUN_TEST_CASE(jrnl_basic, reset_master);
     RUN_TEST_CASE(jrnl_basic, jrnl_start);
     RUN_TEST_CASE(jrnl_basic, jrnl_mount_unmount);
+    RUN_TEST_CASE(jrnl_basic, jrnl_force_fs_format);
+    RUN_TEST_CASE(jrnl_basic, jrnl_format_if_mount_failed);
+    RUN_TEST_CASE(jrnl_basic, jrnl_format_disabled_fails);
     RUN_TEST_CASE(jrnl_basic, direct_read_write);
     RUN_TEST_CASE(jrnl_basic, jrnl_start_write);
     RUN_TEST_CASE(jrnl_basic, jrnl_stop_replay);
