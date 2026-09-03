@@ -1,0 +1,26 @@
+# use custom partition table
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Enable the esp_jrnl built-in test mode so the BDL-path power-off recovery tests can arm
+# the interruption points (ESP_JRNL_TEST_* flags) that drive a real esp_restart() mid-commit.
+CONFIG_ESP_JRNL_ENABLE_TESTMODE=y
+CONFIG_ESP_JRNL_DEBUG_PRINT=n
+
+# Unity drives the test runner through an interactive UART menu (unity_run_menu).
+# The poll loop runs on the main task pinned to CPU0 and starves IDLE0, which
+# trips the default task watchdog after 5 s. Match the jrnl_adv app and disable
+# the task WDT for this interactive test app.
+CONFIG_ESP_TASK_WDT_INIT=n
+
+# The BDL stack exercised here (esp_partition -> wear_levelling -> esp_jrnl ->
+# diskio_bdl -> FatFS) yields a notably deeper call chain than the legacy
+# esp_jrnl_mount path used by the other test apps. The default 3584 B main task
+# stack overflows in tests that also format/mount FatFS (test 7) or that need
+# a sector-sized scratch buffer. 8 KiB leaves a comfortable margin and silent
+# stack overflow (CONFIG_COMPILER_STACK_CHECK_MODE_NONE) was the actual root
+# cause of an early LoadProhibited panic in heap_caps_malloc from the very
+# first esp_partition_get_blockdev call.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

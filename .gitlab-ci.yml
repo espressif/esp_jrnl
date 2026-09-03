@@ -78,6 +78,8 @@ build_apps:
     - idf.py set-target esp32 build
     - cd ../../test_apps/jrnl_adv
     - idf.py set-target esp32 build
+    - cd ../../test_apps/jrnl_bdl
+    - idf.py set-target esp32 build
     - cd ../../examples/basic
     - idf.py set-target esp32 build
 
