@@ -1,7 +1,12 @@
-version: "1.0.4"
-description: ESP-IDF file-system journaling layer (FatFS over SPI Flash)
+version: "1.1.0"
+description: ESP-IDF file-system journaling layer with Block Device Layer (BDL) integration
 url: https://components.espressif.com/components/espressif/esp_jrnl
 repository: https://github.com/espressif/esp_jrnl
 issues: https://github.com/espressif/esp_jrnl/issues
 dependencies:
-  idf: ">=5.3"
+  # The new esp_jrnl_get_blockdev() factory and ESP_JRNL_IOCTL_TRANS_* commands depend on
+  # the Block Device Layer interface (components/esp_blockdev), which was introduced in
+  # IDF v6.0. The legacy callback-based esp_jrnl_mount() API kept in place for backward
+  # compatibility uses the same minimum requirement (the public header now includes
+  # esp_blockdev.h unconditionally).
+  idf: ">=6.0"
