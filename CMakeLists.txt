@@ -11,3 +11,11 @@ idf_component_register(SRCS ${srcs}
                        PRIV_INCLUDE_DIRS private_include
                        REQUIRES esp_blockdev wear_levelling fatfs vfs
                        PRIV_REQUIRES freertos)
+
+# ESP_BLOCKDEV_RESERVE_CMD_RANGE() in include/esp_jrnl.h is only a marker. The
+# esp_blockdev overlap checker sees it only when this header is on the list.
+idf_build_set_property(
+    ESP_BLOCKDEV_IOCTL_DEF_FILES
+    "${CMAKE_CURRENT_LIST_DIR}/include/esp_jrnl.h"
+    APPEND
+)

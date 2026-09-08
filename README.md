@@ -216,7 +216,8 @@ default behaviour is to journal every disk-write — the engine intentionally ne
 Transactions are driven by `esp_blockdev_ops_t::ioctl` on the journaled BDL handle. The
 commands live in the BDL system command space at `ESP_JRNL_IOCTL_BASE = ESP_BLOCKDEV_CMD_SYSTEM_BASE
 + 30` and are reserved with `ESP_BLOCKDEV_RESERVE_CMD_RANGE(esp_jrnl, ESP_JRNL_IOCTL_BASE,
-ESP_JRNL_IOCTL_BASE + 4)` so the build-time overlap checker in `esp_blockdev.h` sees them.
+ESP_JRNL_IOCTL_BASE + 4)`. The header is registered via `ESP_BLOCKDEV_IOCTL_DEF_FILES` so the
+`esp_blockdev` build-time overlap checker actually sees the reservation.
 The authoritative map of system, per-component and user command ranges is in `esp_blockdev.h`
 — do not assume a NAND-specific hole in the system space.
 

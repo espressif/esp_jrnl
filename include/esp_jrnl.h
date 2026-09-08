@@ -323,7 +323,9 @@ esp_err_t esp_jrnl_read(const esp_jrnl_handle_t handle, const uint32_t sector, u
  */
 #define ESP_JRNL_IOCTL_BASE             (ESP_BLOCKDEV_CMD_SYSTEM_BASE + 30)
 
-/* Inclusive reservation of the five ESP_JRNL_IOCTL_* commands for BDL overlap checking. */
+/* Inclusive reservation of the five ESP_JRNL_IOCTL_* commands. The marker is a no-op at
+ * compile time; CMakeLists.txt appends this header to ESP_BLOCKDEV_IOCTL_DEF_FILES so the
+ * esp_blockdev overlap checker picks it up. */
 ESP_BLOCKDEV_RESERVE_CMD_RANGE(esp_jrnl, ESP_JRNL_IOCTL_BASE, ESP_JRNL_IOCTL_BASE + 4);
 
 /**
