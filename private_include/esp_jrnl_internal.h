@@ -10,6 +10,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/lock.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_jrnl.h"
 #include "sdkconfig.h"
@@ -23,24 +26,20 @@ extern "C" {
 #endif
 
 /**
- * @brief Journaling transaction status enumeration
- */
-typedef enum {
-    ESP_JRNL_STATUS_FS_INIT,                /* file-system is being mounted/formatted on the journaled volume */
-    ESP_JRNL_STATUS_FS_DIRECT = ESP_JRNL_STATUS_FS_INIT, /* alias for better code readability */
-    ESP_JRNL_STATUS_TRANS_READY,            /* fresh new log or the last transaction processed completely */
-    ESP_JRNL_STATUS_TRANS_OPEN,             /* journaling transaction running */
-    ESP_JRNL_STATUS_TRANS_COMMIT            /* journaling transaction being committed to the target disk */
-} esp_jrnl_trans_status_t;
-
-/**
  * @brief Journaling operation record header. Covers one 'disk_write' operation
  * (typical file-system API invokes several 'disk_writes' at various stages)
+ *
+ * @note @c esp_jrnl_trans_status_t (the journal transaction status enum) lives in the
+ * public header @c esp_jrnl.h since the BDL ioctl @c ESP_JRNL_IOCTL_GET_STATUS exposes it.
  */
+#define ESP_JRNL_OP_WRITE               0u  /* journaled write (header + data sectors) */
+#define ESP_JRNL_OP_ERASE               1u  /* journaled erase (header only) */
+
 typedef struct {
-    uint32_t target_sector;                 /* target sector number in the filesystem (first sector of the sequence) */
-    size_t sector_count;                    /* number of sectors involved in current operation */
-    uint32_t crc32_data;                    /* sector data checksum (all sectors in the sequence) */
+    uint64_t target_sector;                 /* first target sector in the filesystem address space */
+    uint32_t sector_count;                  /* number of sectors involved in current operation */
+    uint32_t op_type;                       /* ESP_JRNL_OP_WRITE or ESP_JRNL_OP_ERASE */
+    uint32_t crc32_data;                    /* sector data checksum (write); 0 for erase */
 } esp_jrnl_oper_header_t;
 
 typedef struct {
@@ -53,8 +52,9 @@ typedef struct {
  */
 typedef struct {
     uint32_t jrnl_magic_mark;               /* journaling store master record identification stamp */
-    size_t store_size_sectors;              /* size of journaling store in sectors */
-    size_t store_volume_offset_sector;      /* index of the first journaling store sector within the volume */
+    uint32_t format_version;                /* JRNL_STORE_FORMAT_VERSION; reject unknown versions on mount */
+    uint32_t store_size_sectors;            /* size of journaling store in sectors */
+    uint64_t store_volume_offset_sector;    /* index of the first journaling store sector within the volume */
     uint32_t next_free_sector;              /* next free block. Default = 0 (relative offset in the store space) */
     esp_jrnl_trans_status_t status;         /* transaction status. Default = ESP_JRNL_STATUS_TRANS_READY */
     esp_jrnl_volume_t volume;               /* disk volume properties */
@@ -62,21 +62,161 @@ typedef struct {
 
 /**
  * @brief Runtime configuration of a single journaling store instance. Not stored on the target media, memory only
+ *
+ * The instance always operates on top of a BDL device pointed to by @c bottom_bdl. The two
+ * supported creation flows differ only in how that bottom BDL is obtained:
+ *  - legacy @ref esp_jrnl_mount path: a tiny synthetic "callback-bridge" BDL is built around
+ *    the @c esp_jrnl_diskio_t callbacks and owned by the instance (@c owns_bottom_bdl = true);
+ *  - new @ref esp_jrnl_get_blockdev path: @c bottom_bdl points to a real BDL provided by the
+ *    caller, who retains ownership (@c owns_bottom_bdl = false).
  */
 typedef struct {
     _lock_t trans_lock;
-    /* [mass-production fix #5] recursive C-library lock (sys/lock.h) serializing a whole
-     * transaction window (esp_jrnl_start .. FS op .. esp_jrnl_stop) against concurrent tasks
-     * using the same mount. Distinct from trans_lock, which only guards the short master-record
-     * critical sections. */
-    _lock_t trans_owner_lock;
-    uint8_t fs_volume_id;                   /* file-system volume ID (PDRV for FatFS) */
-    esp_jrnl_diskio_t diskio;               /* disk device access configuration */
+    /* Binary semaphore serializing one transaction window. START takes it, COMMIT/CANCEL
+     * give it — give can come from any task, so the closer need not be the opener.
+     * Distinct from trans_lock, which only guards short master-record critical sections. */
+    SemaphoreHandle_t window_sem;
+    TaskHandle_t window_owner;              /* task that last successfully opened the window; used to reject nested START */
+    bool implicit_transactions;             /* runtime copy of user_cfg.implicit_transactions */
+    uint8_t fs_volume_id;                   /* file-system volume ID (PDRV for FatFS); legacy path only */
+    esp_jrnl_diskio_t diskio;               /* disk device access configuration; legacy path only */
+    esp_blockdev_handle_t bottom_bdl;       /* underlying BDL device used for all raw I/O */
+    bool owns_bottom_bdl;                   /* true if bottom_bdl is the internal callback-bridge BDL and must be released with the instance */
     esp_jrnl_master_t master;               /* journal master record for given instance */
 #ifdef CONFIG_ESP_JRNL_ENABLE_TESTMODE
     uint32_t test_config;                   /* runtime flags for internal testing, 0x0 by default */
 #endif
 } esp_jrnl_instance_t;
+
+/**
+ * @brief Build an internal callback-bridge BDL wrapping the legacy @c esp_jrnl_diskio_t callbacks
+ *
+ * Used by @ref esp_jrnl_mount to keep a single internal code path (everything goes through BDL
+ * ops). The synthetic BDL is initialized with SPI Flash defaults
+ * (@c erase_before_write=1, @c and_type_write=1, @c default_val_after_erase=1), which preserves
+ * the historical behavior of @c esp_vfs_fat_spiflash_mount_jrnl over wear-levelling exactly.
+ *
+ * @param[in]  diskio       Legacy disk-I/O callbacks (must all be non-NULL)
+ * @param[in]  volume_size  Total disk space exposed by the callbacks, in bytes
+ * @param[in]  sector_size  Sector size used by the callbacks (granularity of read/write/erase)
+ * @param[out] out_bdl      Receives the synthesized BDL handle on success (must be released with @c ops->release)
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_ARG on invalid inputs
+ *      - ESP_ERR_NO_MEM on allocation failure
+ */
+esp_err_t jrnl_legacy_bridge_bdl_create(const esp_jrnl_diskio_t *diskio,
+                                        uint64_t volume_size,
+                                        size_t sector_size,
+                                        esp_blockdev_handle_t *out_bdl);
+
+/**
+ * @brief Internal handler shared by both API paths. Allocates an @c esp_jrnl_instance_t,
+ * reads and validates the on-disk master record (if any), optionally replays a pending
+ * transaction, and writes a fresh master record when needed.
+ *
+ * Caller owns @c bottom_bdl; this function does not release it on failure.
+ *
+ * @param[in]  user_cfg     Journal user configuration
+ * @param[in]  bottom_bdl   Underlying BDL (real or synthetic callback-bridge)
+ * @param[in]  owns_bdl     Whether the produced instance should release @c bottom_bdl when freed
+ * @param[in]  diskio       Legacy disk-I/O config; copied into the instance for backward-compat accessors. May be NULL for the BDL path.
+ * @param[in]  fs_volume_id File-system volume id; only meaningful for the legacy path. Use 0 for BDL path.
+ * @param[out] out_instance Receives the allocated instance on success
+ *
+ * @return
+ *      - ESP_OK on success; @c *out_instance is non-NULL.
+ *      - ESP_ERR_INVALID_ARG / ESP_ERR_INVALID_STATE / ESP_ERR_NO_MEM on failure; @c *out_instance is NULL.
+ */
+esp_err_t jrnl_instance_create(const esp_jrnl_config_t *user_cfg,
+                               esp_blockdev_handle_t bottom_bdl,
+                               bool owns_bdl,
+                               const esp_jrnl_diskio_t *diskio,
+                               uint8_t fs_volume_id,
+                               esp_jrnl_instance_t **out_instance);
+
+/**
+ * @brief Free an @c esp_jrnl_instance_t allocated by @ref jrnl_instance_create.
+ *
+ * Releases @c bottom_bdl if and only if the instance was created with @c owns_bottom_bdl = true.
+ * Does NOT touch the on-disk master record; pending transactions are resolved by @c jrnl_replay()
+ * on the next mount (discarded if OPEN, completed if COMMIT).
+ *
+ * @param[in] inst_ptr  Journal instance to free (may be NULL)
+ */
+void jrnl_instance_destroy(esp_jrnl_instance_t *inst_ptr);
+
+/**
+ * @brief Instance-pointer transaction control shared by the legacy handle API and the BDL ioctl path.
+ *
+ * jrnl_inst_trans_start() takes @c window_sem and holds it until the paired
+ * jrnl_inst_trans_stop() (any task may stop). Nested START from the owning task returns
+ * ESP_ERR_INVALID_STATE without touching the semaphore. STOP without an open transaction
+ * returns ESP_ERR_INVALID_STATE and does not give the semaphore.
+ */
+esp_err_t jrnl_inst_trans_start(esp_jrnl_instance_t *inst_ptr);
+esp_err_t jrnl_inst_trans_stop(esp_jrnl_instance_t *inst_ptr, bool commit);
+esp_err_t jrnl_inst_set_direct_io(esp_jrnl_instance_t *inst_ptr, bool direct_access);
+
+/**
+ * @brief Log a write (@c buff != NULL) or erase (@c buff == NULL) in an open transaction,
+ *        or wrap the same operation in an implicit START/COMMIT when the store is READY
+ *        and @c implicit_transactions is set. Any other state returns @c ESP_ERR_INVALID_STATE.
+ */
+esp_err_t jrnl_inst_log_or_implicit(esp_jrnl_instance_t *inst_ptr,
+                                    const uint8_t *buff,
+                                    uint64_t sector,
+                                    uint32_t count);
+
+/**
+ * @brief Append a journaled-write record (header + data) to an open journal store.
+ *
+ * Instance-pointer counterpart of @ref esp_jrnl_write's @c TRANS_OPEN branch, factored out so
+ * that both the legacy integer-handle API and the BDL ioctl/op path share one implementation.
+ * The transaction status is re-validated under @c trans_lock: a caller-side check is racy
+ * because COMMIT/CANCEL may be issued from any task, so this function returns
+ * @c ESP_ERR_INVALID_STATE if the transaction is no longer open by the time the record
+ * would be appended.
+ *
+ * @param[in] inst_ptr Journal instance
+ * @param[in] buff     Source data buffer (length @c count * sector_size bytes)
+ * @param[in] sector   Target sector index in the file-system address space
+ * @param[in] count    Number of consecutive sectors covered by this write
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_STATE if no transaction is open
+ *      - ESP_ERR_INVALID_ARG / ESP_ERR_NO_MEM / underlying errors otherwise
+ */
+esp_err_t jrnl_log_write(esp_jrnl_instance_t *inst_ptr,
+                         const uint8_t *buff,
+                         const uint64_t sector,
+                         const uint32_t count);
+
+/**
+ * @brief Append a journaled-erase record (header only) to an open journal store.
+ *
+ * Replay applies the erase to the target range. On media without host-driven erase
+ * (@c erase_before_write == 0) the logged erase is a no-op at replay time. Status is
+ * re-validated under @c trans_lock the same way as @ref jrnl_log_write.
+ */
+esp_err_t jrnl_log_erase(esp_jrnl_instance_t *inst_ptr,
+                         const uint64_t sector,
+                         const uint32_t count);
+
+/**
+ * @brief Read a byte range from the target volume, overlaying any open-transaction records.
+ *
+ * Always starts with a bottom-device read of [@c src_addr, @c src_addr + @c len). When a
+ * transaction is open, later journaled WRITE/ERASE records that overlap the range replace
+ * that slice (erase fills @c default_val_after_erase). Used by both @c esp_jrnl_read and
+ * the journaled BDL read op so FatFS read-modify-write sees its own uncommitted writes.
+ */
+esp_err_t jrnl_log_read(esp_jrnl_instance_t *inst_ptr,
+                        uint8_t *dest,
+                        uint64_t src_addr,
+                        size_t len);
 
 /* Internal test flags (runtime configuration, not stored in the journal)
  * All the flags cause preliminary exit of esp_jrnl_stop() or jrnl_replay() in various stages, all return with ESP_OK
@@ -89,6 +229,8 @@ typedef struct {
 #define ESP_JRNL_TEST_REPLAY_EXIT_BEFORE_CLOSE      0x00000010  /* finish transferring all the journaled sectors but don't set the master status to READY, and exit */
 #define ESP_JRNL_TEST_REQUIRE_FILE_CLOSE            0x00000020  /* fclose()/close() operation required for given testing procedure */
 #define ESP_JRNL_TEST_SUSPEND_TRANSACTION           0x00000040  /* keeps jrnl_start/stop disabled, allows direct FS operations */
+#define ESP_JRNL_TEST_LOG_RACE_DELAY                0x00000080  /* delay between the unlocked status dispatch check and the journal append, so a
+                                                                 * test can commit from another task in the gap and exercise the append-vs-commit race */
 #endif
 
 /**
@@ -136,7 +278,7 @@ esp_err_t jrnl_check_handle(const esp_jrnl_handle_t handle, const char *func);
  *
  * @return parent partition disk sector index
  */
-uint32_t jrnl_get_target_disk_sector(const esp_jrnl_instance_t* inst_ptr, const uint32_t jrnl_sector);
+uint64_t jrnl_get_target_disk_sector(const esp_jrnl_instance_t* inst_ptr, const uint32_t jrnl_sector);
 
 /**
  * @brief Reads 'count' sectors from the journaling store instance given by ínst_ptr' and referenced by 'sector' index
