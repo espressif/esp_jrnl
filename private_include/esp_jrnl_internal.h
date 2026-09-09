@@ -174,8 +174,10 @@ esp_err_t jrnl_inst_log_or_implicit(esp_jrnl_instance_t *inst_ptr,
  *
  * Instance-pointer counterpart of @ref esp_jrnl_write's @c TRANS_OPEN branch, factored out so
  * that both the legacy integer-handle API and the BDL ioctl/op path share one implementation.
- * The caller must have already verified that a transaction is open
- * (@c inst_ptr->master.status == @c ESP_JRNL_STATUS_TRANS_OPEN).
+ * The transaction status is re-validated under @c trans_lock: a caller-side check is racy
+ * because COMMIT/CANCEL may be issued from any task, so this function returns
+ * @c ESP_ERR_INVALID_STATE if the transaction is no longer open by the time the record
+ * would be appended.
  *
  * @param[in] inst_ptr Journal instance
  * @param[in] buff     Source data buffer (length @c count * sector_size bytes)
@@ -184,6 +186,7 @@ esp_err_t jrnl_inst_log_or_implicit(esp_jrnl_instance_t *inst_ptr,
  *
  * @return
  *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_STATE if no transaction is open
  *      - ESP_ERR_INVALID_ARG / ESP_ERR_NO_MEM / underlying errors otherwise
  */
 esp_err_t jrnl_log_write(esp_jrnl_instance_t *inst_ptr,
@@ -195,7 +198,8 @@ esp_err_t jrnl_log_write(esp_jrnl_instance_t *inst_ptr,
  * @brief Append a journaled-erase record (header only) to an open journal store.
  *
  * Replay applies the erase to the target range. On media without host-driven erase
- * (@c erase_before_write == 0) the logged erase is a no-op at replay time.
+ * (@c erase_before_write == 0) the logged erase is a no-op at replay time. Status is
+ * re-validated under @c trans_lock the same way as @ref jrnl_log_write.
  */
 esp_err_t jrnl_log_erase(esp_jrnl_instance_t *inst_ptr,
                          const uint64_t sector,
@@ -225,6 +229,8 @@ esp_err_t jrnl_log_read(esp_jrnl_instance_t *inst_ptr,
 #define ESP_JRNL_TEST_REPLAY_EXIT_BEFORE_CLOSE      0x00000010  /* finish transferring all the journaled sectors but don't set the master status to READY, and exit */
 #define ESP_JRNL_TEST_REQUIRE_FILE_CLOSE            0x00000020  /* fclose()/close() operation required for given testing procedure */
 #define ESP_JRNL_TEST_SUSPEND_TRANSACTION           0x00000040  /* keeps jrnl_start/stop disabled, allows direct FS operations */
+#define ESP_JRNL_TEST_LOG_RACE_DELAY                0x00000080  /* delay between the unlocked status dispatch check and the journal append, so a
+                                                                 * test can commit from another task in the gap and exercise the append-vs-commit race */
 #endif
 
 /**

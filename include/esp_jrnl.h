@@ -132,10 +132,19 @@ esp_err_t esp_jrnl_mount(const esp_jrnl_config_extended_t *config, esp_jrnl_hand
 /**
  * @brief Deletes FS journal instance given by the handle and clears the handle afterwards
  *
+ * A leftover open or committing transaction is cancelled (the on-disk master record is reset)
+ * before the instance is freed. If another task holds the transaction window, this call blocks
+ * until that task finishes.
+ *
+ * @note The caller must stop all file-system access to this mount before unmounting. A task that
+ *       is already blocked waiting for the transaction window when the instance is destroyed
+ *       cannot be woken safely; unmounting under concurrent I/O is undefined behaviour.
+ *
  * @param handle  FS journal instance handle
  *
  * @return
  *      - ESP_OK on success
+ *      - ESP_ERR_TIMEOUT if the transaction window could not be acquired
  *      - errors from jrnl_check_handle()
  */
 esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle);

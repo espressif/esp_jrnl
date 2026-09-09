@@ -213,9 +213,19 @@ esp_err_t jrnl_reset_master(esp_jrnl_instance_t* jrnl, bool fs_direct)
         ESP_LOGD(TAG, msg); \
         return ESP_OK; \
     }
+
+/* Widen the window between the unlocked status dispatch check and the journal append so a
+ * test can deterministically commit from another task in between. */
+#define JRNL_TEST_LOG_RACE_DELAY_MS                 1500
+#define JRNL_TEST_LOG_RACE_DELAY() \
+    if (inst_ptr->test_config & ESP_JRNL_TEST_LOG_RACE_DELAY) { \
+        ESP_LOGD(TAG, "(jrnl_race_test): delaying before the journal append"); \
+        vTaskDelay(pdMS_TO_TICKS(JRNL_TEST_LOG_RACE_DELAY_MS)); \
+    }
 #else
 #define JRNL_TEST_PRELIMINARY_EXIT(flags, msg)
 #define JRNL_TEST_TRANSACTION_SUSPENDED(msg)
+#define JRNL_TEST_LOG_RACE_DELAY()
 #endif
 
 esp_err_t jrnl_replay(esp_jrnl_instance_t* inst_ptr)
@@ -615,6 +625,9 @@ esp_err_t jrnl_inst_log_or_implicit(esp_jrnl_instance_t *inst_ptr,
     const bool is_erase = (buff == NULL);
 
     if (inst_ptr->master.status == ESP_JRNL_STATUS_TRANS_OPEN) {
+        /* Test hook only: this read of master.status is intentionally unlocked, and the append
+         * below re-validates it under trans_lock. See jrnl_log_write(). */
+        JRNL_TEST_LOG_RACE_DELAY();
         return is_erase ? jrnl_log_erase(inst_ptr, sector, count)
                         : jrnl_log_write(inst_ptr, buff, sector, count);
     }
@@ -870,12 +883,32 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle)
         return err;
     }
 
-    /* Wait out any other task's transaction window. Unmount from the owning task must not
-     * take (would deadlock); destroy then deletes the still-taken semaphore. */
     esp_jrnl_instance_t* inst_ptr = s_jrnl_instance_ptrs[handle];
     const bool self_owned = (inst_ptr->window_owner == xTaskGetCurrentTaskHandle());
+
+    /* Detach the instance before doing anything slow, so no new caller can look it up
+     * through the public API while we are waiting, and release the global table lock so
+     * a blocking wait on this instance's window does not stall mount/unmount of others. */
+    s_jrnl_instance_ptrs[handle] = NULL;
+    _lock_release(&s_instances_lock);
+
+    /* Wait out any other task's transaction window. Unmounting from the task that owns the
+     * window must not take (it would deadlock on its own binary semaphore); jrnl_delete_instance()
+     * then deletes the still-taken semaphore.
+     *
+     * NOTE: a task already blocked inside jrnl_window_take() when we get here cannot be rescued -
+     * giving the semaphore would hand it a pointer we are about to free, and deleting it under a
+     * blocked xSemaphoreTake() is equally unsafe. Stopping all FS access before unmounting stays a
+     * caller responsibility (see esp_jrnl_unmount() docs); warn loudly so misuse is diagnosable. */
     if (!self_owned) {
+        if (inst_ptr->window_owner != NULL) {
+            ESP_LOGW(TAG, "esp_jrnl_unmount: a transaction is open in another task - stop all "
+                          "file-system access on this mount before unmounting");
+        }
         if (xSemaphoreTake(inst_ptr->window_sem, portMAX_DELAY) != pdTRUE) {
+            /* Re-attach: we did not manage to quiesce the instance, so do not destroy it. */
+            _lock_acquire(&s_instances_lock);
+            s_jrnl_instance_ptrs[handle] = inst_ptr;
             _lock_release(&s_instances_lock);
             return ESP_ERR_TIMEOUT;
         }
@@ -888,17 +921,13 @@ esp_err_t esp_jrnl_unmount(const esp_jrnl_handle_t handle)
         _lock_acquire(&inst_ptr->trans_lock);
         (void)jrnl_reset_master(inst_ptr, false);
         _lock_release(&inst_ptr->trans_lock);
-        inst_ptr->window_owner = NULL;
     }
+    inst_ptr->window_owner = NULL;
 
-    s_jrnl_instance_ptrs[handle] = NULL;
-    if (!self_owned) {
-        xSemaphoreGive(inst_ptr->window_sem);
-    }
-
+    /* Deliberately no xSemaphoreGive() here: jrnl_delete_instance() deletes the semaphore
+     * while it is held, which is the documented teardown contract (see jrnl_instance_destroy()).
+     * Re-arming it would only wake a waiter into a use-after-free. */
     jrnl_delete_instance(inst_ptr);
-
-    _lock_release(&s_instances_lock);
 
     return ESP_OK;
 }
@@ -992,8 +1021,11 @@ esp_err_t esp_jrnl_set_direct_io(const esp_jrnl_handle_t handle, bool direct_acc
 /*
  * Append one journaled-write record (header + data) to an open journal store. This is the core
  * of the "log a write" operation and is shared between esp_jrnl_write (legacy integer-handle
- * API) and the BDL op-table's write entry point. The caller has already verified that the
- * instance is in ESP_JRNL_STATUS_TRANS_OPEN.
+ * API) and the BDL op-table's write entry point.
+ *
+ * Callers typically pre-check for ESP_JRNL_STATUS_TRANS_OPEN, but that check is racy on its own
+ * (COMMIT/CANCEL may come from any task), so this function re-validates the status under
+ * trans_lock and returns ESP_ERR_INVALID_STATE if the transaction closed in the meantime.
  */
 esp_err_t jrnl_log_write(esp_jrnl_instance_t *inst_ptr,
                          const uint8_t *buff,
@@ -1006,17 +1038,30 @@ esp_err_t jrnl_log_write(esp_jrnl_instance_t *inst_ptr,
 
     const uint32_t sector_size = inst_ptr->master.volume.disk_sector_size;
 
-    /* Must fit: 1 header sector + count data sectors must leave the master sector untouched. */
-    if ((inst_ptr->master.next_free_sector + 1 + count) >= (inst_ptr->master.store_size_sectors - 1)) {
-        ESP_LOGE(TAG, "jrnl_log_write: not enough space in the store (0x%08X)", ESP_ERR_NO_MEM);
-        return ESP_ERR_NO_MEM;
-    }
-
     esp_jrnl_operation_t *oper_header = NULL;
     esp_err_t err = ESP_OK;
 
     _lock_acquire(&inst_ptr->trans_lock);
     do {
+        /* The caller's status check is only a hint - it is made without trans_lock, and
+         * COMMIT/CANCEL may be issued from any task. Re-check authoritatively here so a
+         * transaction closed under us cannot get a record appended (and next_free_sector
+         * bumped) into a store that is being replayed or has just been reset. */
+        if (inst_ptr->master.status != ESP_JRNL_STATUS_TRANS_OPEN) {
+            err = ESP_ERR_INVALID_STATE;
+            ESP_LOGE(TAG, "jrnl_log_write: transaction not open (status=%s)",
+                     jrnl_status_to_str(inst_ptr->master.status));
+            break;
+        }
+
+        /* Must fit: 1 header sector + count data sectors must leave the master sector
+         * untouched. Checked under the lock - next_free_sector is shared mutable state. */
+        if ((inst_ptr->master.next_free_sector + 1 + count) >= (inst_ptr->master.store_size_sectors - 1)) {
+            err = ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "jrnl_log_write: not enough space in the store (0x%08X)", err);
+            break;
+        }
+
         oper_header = (esp_jrnl_operation_t *)calloc(1, sector_size);
         if (oper_header == NULL) {
             err = ESP_ERR_NO_MEM;
@@ -1077,17 +1122,27 @@ esp_err_t jrnl_log_erase(esp_jrnl_instance_t *inst_ptr,
 
     const uint32_t sector_size = inst_ptr->master.volume.disk_sector_size;
 
-    /* Header-only record; must leave the master sector untouched. */
-    if ((inst_ptr->master.next_free_sector + 1) >= (inst_ptr->master.store_size_sectors - 1)) {
-        ESP_LOGE(TAG, "jrnl_log_erase: not enough space in the store (0x%08X)", ESP_ERR_NO_MEM);
-        return ESP_ERR_NO_MEM;
-    }
-
     esp_jrnl_operation_t *oper_header = NULL;
     esp_err_t err = ESP_OK;
 
     _lock_acquire(&inst_ptr->trans_lock);
     do {
+        /* See jrnl_log_write(): the caller's status check is racy by construction, so the
+         * authoritative one lives here, inside trans_lock. */
+        if (inst_ptr->master.status != ESP_JRNL_STATUS_TRANS_OPEN) {
+            err = ESP_ERR_INVALID_STATE;
+            ESP_LOGE(TAG, "jrnl_log_erase: transaction not open (status=%s)",
+                     jrnl_status_to_str(inst_ptr->master.status));
+            break;
+        }
+
+        /* Header-only record; must leave the master sector untouched. */
+        if ((inst_ptr->master.next_free_sector + 1) >= (inst_ptr->master.store_size_sectors - 1)) {
+            err = ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "jrnl_log_erase: not enough space in the store (0x%08X)", err);
+            break;
+        }
+
         oper_header = (esp_jrnl_operation_t *)calloc(1, sector_size);
         if (oper_header == NULL) {
             err = ESP_ERR_NO_MEM;

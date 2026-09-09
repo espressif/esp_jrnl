@@ -451,6 +451,126 @@ TEST_CASE("(jrnl-bdl) cross-task COMMIT", "[jrnl][bdl]")
     stack_tear_down(&stk);
 }
 
+#ifdef CONFIG_ESP_JRNL_ENABLE_TESTMODE
+
+typedef struct {
+    esp_blockdev_handle_t jrnl_bdl;
+    const uint8_t *buff;
+    uint64_t offset;
+    size_t len;
+    SemaphoreHandle_t done;
+    esp_err_t err;
+} jrnl_race_write_ctx_t;
+
+static void jrnl_race_writer(void *arg)
+{
+    jrnl_race_write_ctx_t *ctx = (jrnl_race_write_ctx_t *)arg;
+    ctx->err = ctx->jrnl_bdl->ops->write(ctx->jrnl_bdl, ctx->buff, ctx->offset, ctx->len);
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+/*
+ * Regression test: a journal append must not land in a store that was committed underneath it.
+ *
+ * The status check that routes a write to the journal is made without trans_lock, and since
+ * COMMIT may be issued from any task, the transaction can close between that check and the
+ * actual append. ESP_JRNL_TEST_LOG_RACE_DELAY widens that gap deterministically:
+ *
+ *   writer task : sees TRANS_OPEN -> [delay] ------------------> append
+ *   this task   :                    -> TRANS_COMMIT (replay, master reset to READY)
+ *
+ * The append must be refused. Before the status was re-validated under trans_lock it would
+ * succeed, writing a record into a just-reset store and advancing next_free_sector while the
+ * master said READY - i.e. a corrupt journal that the next TRANS_START would trip over.
+ */
+TEST_CASE("(jrnl-bdl) append racing a cross-task COMMIT is refused", "[jrnl][bdl][concurrency]")
+{
+    esp_jrnl_config_t cfg = ESP_JRNL_DEFAULT_CONFIG();
+    cfg.overwrite_existing = true;
+
+    jrnl_bdl_stack_t stk;
+    stack_build(&stk, &cfg);
+
+    esp_jrnl_instance_t *inst = (esp_jrnl_instance_t *)stk.jrnl_bdl->ctx;
+    const size_t sec = stk.jrnl_bdl->geometry.write_size;
+
+    uint8_t *committed = malloc(sec);
+    uint8_t *racing = malloc(sec);
+    uint8_t *readback = malloc(sec);
+    TEST_ASSERT_NOT_NULL(committed);
+    TEST_ASSERT_NOT_NULL(racing);
+    TEST_ASSERT_NOT_NULL(readback);
+    memset(committed, 0x5A, sec);
+    memset(racing, 0xA5, sec);
+
+    const uint64_t committed_at = 2 * sec;
+    const uint64_t racing_at    = 3 * sec;
+
+    /* Seed racing_at with a known pattern in its own committed transaction. Asserting against a
+     * seed rather than the erased value keeps the test independent of what earlier cases left on
+     * the media (overwrite_existing resets the journal, not the data area). The seed must differ
+     * from the racing pattern so a leaked append is detectable. */
+    memset(readback, 0x3C, sec);
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_START, NULL));
+    TEST_ESP_OK(stk.jrnl_bdl->ops->write(stk.jrnl_bdl, readback, racing_at, sec));
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_COMMIT, NULL));
+
+    /* Open a transaction with one legitimate record in it. */
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_START, NULL));
+    TEST_ESP_OK(stk.jrnl_bdl->ops->write(stk.jrnl_bdl, committed, committed_at, sec));
+
+    /* Arm the hook and launch a writer that will stall between its status check and its append. */
+    inst->test_config |= ESP_JRNL_TEST_LOG_RACE_DELAY;
+
+    jrnl_race_write_ctx_t ctx = {
+        .jrnl_bdl = stk.jrnl_bdl,
+        .buff = racing,
+        .offset = racing_at,
+        .len = sec,
+        .done = xSemaphoreCreateBinary(),
+        .err = ESP_FAIL,
+    };
+    TEST_ASSERT_NOT_NULL(ctx.done);
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreate(jrnl_race_writer, "jrnl_race", 4096, &ctx, 5, NULL));
+
+    /* Let the writer get past its status check and into the delay, then commit underneath it.
+     * Clear the flag first so the commit path itself is never delayed. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+    inst->test_config &= ~ESP_JRNL_TEST_LOG_RACE_DELAY;
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_COMMIT, NULL));
+
+    /* The commit must have completed and closed the store before the writer wakes. */
+    TEST_ASSERT_EQUAL(ESP_JRNL_STATUS_TRANS_READY, inst->master.status);
+
+    TEST_ASSERT_EQUAL(pdTRUE, xSemaphoreTake(ctx.done, pdMS_TO_TICKS(10000)));
+    vSemaphoreDelete(ctx.done);
+
+    /* The racing append must have been refused... */
+    TEST_ASSERT_EQUAL_HEX32(ESP_ERR_INVALID_STATE, ctx.err);
+
+    /* ...and must have left no trace in the journal store or on the media. */
+    TEST_ASSERT_EQUAL_UINT32(0, inst->master.next_free_sector);
+    TEST_ASSERT_EQUAL(ESP_JRNL_STATUS_TRANS_READY, inst->master.status);
+
+    TEST_ESP_OK(stk.jrnl_bdl->ops->read(stk.jrnl_bdl, readback, sec, committed_at, sec));
+    TEST_ASSERT_EQUAL_MEMORY(committed, readback, sec);
+
+    TEST_ESP_OK(stk.jrnl_bdl->ops->read(stk.jrnl_bdl, readback, sec, racing_at, sec));
+    TEST_ASSERT_EACH_EQUAL_HEX8(0x3C, readback, sec);
+
+    /* A store left consistent by the rejection accepts a new transaction. */
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_START, NULL));
+    TEST_ESP_OK(stk.jrnl_bdl->ops->ioctl(stk.jrnl_bdl, ESP_JRNL_IOCTL_TRANS_CANCEL, NULL));
+
+    free(committed);
+    free(racing);
+    free(readback);
+    stack_tear_down(&stk);
+}
+
+#endif /* CONFIG_ESP_JRNL_ENABLE_TESTMODE */
+
 /*
  * 6. Replay-after-restart: leave a COMMIT-state journal on disk (by faulting after the master
  *    update but before replay completes), then reopen the stack and confirm jrnl_replay()
